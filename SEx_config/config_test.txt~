@@ -1,0 +1,189 @@
+#PER L'ESTRAZIONE SUL CANALE CH1 IRAC
+
+# RISPETTO A TUTTE LE PRECEDENTI ESTRAZIONI (SBAGLIATE)
+# WEIGHT_TYPE MAP_WEIGHT
+# La mappa usata è 
+# 80039.0.irac.1.mosaic_unc_invrtd.fits , che è la mappa delle uncertainties invertita e quadrata.
+
+# configuration file for SExtractor 2.8.6
+# you can obtain the default file typing >sex -dd
+# EB 2009-04-09
+
+#CATALOG_TYPE FITS_1.0 al posto di ASCII_HEAD
+
+#FWHM 1.66"  come da handbook (per I2 riporta 1.72")
+
+#PIXEL_SCALE 0.6" (come da handbook e da header per I1 e I2).
+
+#GAIN 1.1x10^8 CH1 (CH1), 1.28x10^8 (CH2). Leggi record_tests.txt
+
+#WEIGHT_GAIN N . Leggi record_tests.txt
+
+#MAG_ZEROPOINT 8.9 (CH1 e CH2). handbook riporta 18.80 (CH1) e 18.32 (CH2) per pixel scale =0.6. In realtà questi zeropoint si riferiscono a specifiche aperture sulle quali vengano calcolati i flussi e non si capisce bene in quali unità (MJy/str?). In generale, la magnitudine di zeropoint è la magnitudine: +2.5log(F_0), definita a partire dal flusso F_0, ad una certa lunghezza d'onda, preso come origine del sistema di magnitudini utilizzato. Per lo stesso sistema di magnitudini si ha dunque che mag=-2.5log(F/F_0)=-2.5log(F)+2.5log(F_0). Per il sistema AB si ha mag_AB=-2.5log(Fv)-48.60. In questa equazione Fv rappresenta il flusso espresso in erg s^(-1) cm^(-2) Hz^(-1). 48.60 è la magnitudine di punto zero. Leggere anche record_tests.fits
+
+#MAG_GAMMA (niente). Comunque questo non dovrebbe cambiare la funzionalità di SE dato che è qui settatto su DETECT_TYPE CCD ed il parametro = MAG_GAMMA concerne il solo uso di lastre fotografiche
+
+#NONONONONONONONONO
+#SATUR_LEVEL 43939.3 Per CH2 è 37837.8. Il valore è ottenuto considerando: SATUR_LEVEL=Well_depth(e-)/GAIN. Well_depth è riportato nell'handbook per ogni canale (ch1->145000, ch2->140000, tabella 2.2) ed anche il gain (tabella 2.4).
+#NONONONONONONONONO
+# Well_depth è riportato nell'handbook per ogni canale (ch1->145000, ch2->140000, tabella 2.2). Per ottenere la misura in elettroni/sec bisogna dividere per il tempo di esposizione (150s). Trasforamando i valori da elettroni/s a MJy/str, dobbiamo dividere per 25 (29 per CH2). Infine, per trasformare il valore di saturazione in Jy/pixel, questa volta i pixels sono considerati di 0.6", come le mappe qui utilizzate, bisogna moltiplicare per 8.46X10^(-6).
+# Si ottiene quindi un valore di saturazione pari a 3.27e-3 (Jy) per CH1 e 2.72 Jy per CH2.
+#SATUR_LEVEL 3.27e-3 CH1 2.72-3 CH2
+#In realtà mantengo il valore della saturazione molto alto per evitare di eliminare sorgenti brillanti. Vedi valore effettivamente impostato.
+
+
+#BACK_SIZE lo pongo pari a 32. La dimensione tipica delle sorgenti è di una decina di pixels (ad occhio). Le immagini di check mostrano un bakground contaminato da sorgenti anche a 96. VALUTATO SOLO PER CH1
+
+#BACK_FILTERSIZE lo lascio pari a 3. Vedi i test fatti in /prova2/ su una BACK_SIZE pari a 128.  VALUTATO SOLO PER CH1
+
+#BACKPHOTO_TYPE   LOCAL (precedentemente era GLOBAL) Con questo comando viene ricalcolato il background su scala locale e sottratto nuovamente per un'accurata fotometria.
+
+#BACKPHOTO_THICK  15  (in prova4 è 64. Di default è 24) Questo anello deve avere dimensioni maggiori di quelle medie delle sorgenti. VALUTATO SOLO PER CH1. La distribuzione delle dimensioni delle sorgenti (ottenibile con lo script IDL dim_dist_sources.pro), mostra che il quartile maggiore della distribuzione di KRON_RADIUS[pixels] per le sorgenti è 9.4 pixels. La distribuzione va inoltre praticamente a zero proprio a circa  15 pixels. Per quanto riguarda la distribuzione dei semiassi maggiori (A_IMAGE) delle sorgenti, questa ha l'ultimo quartile posto a 2.2 pixels e va praticamente a zero a 4 pixels.
+
+#WAIGHTING MAP_WEIGHT 
+#WEIGHT_IMAGE 80039.0.irac.1.mosaic_unc_invrtd.fits
+#WEIGHT_GAIN N
+#WEIGHT_THRESH niente!
+
+#FILTER_NAME /home/baronchelli/SEXTRACTOR/config/gauss_2.5_5x5.conv  Prima era default.conv. Il filtro gaussiano va bene per una FWHM compresa tra 1.5 e 5 pixels. Nel nostro caso FWHM=1.66" e pixel_scale=0.6", quindi 1.6"/(0.6["/pixel])=2.67 e scegliamo dunque il filtro gaussiano che più si avvicina (2.5 pixels come FWHM). Per altre scelte vedere i files riportati in /home/baronchelli/SEXTRACTOR/config.
+
+#PHOT_APERTURES 8, 12, 20, 40 al posto di 5 da default. ATTENZIONE(1): le quantità riportate sono i diametri delle aperture, non raggi!!! ATTENZIONE(2): si possono anche indicare più aperture. per ottenere il risultato di tutte le aperture, bisogna specificare nel default.param 
+#FLUX_APER(numero_aperture)    -> al posto di (1)
+#FLUXERR_APER(numero_aperture) -> al posto di (1)
+#Le aperture sono sceltein modo da coincidere con quelle riportate nell'handbook IRAC e per le quali esiste una correzione d'apertura.
+
+#Rapporto Petrosian: rapporto tra brillanza dell'isofota tra r ed r+dr e brillanza totale.
+#Raggio Petrosian: raggio per il quale il rapporto scende al di sotto di una certa soglia (SDSS usa 0.2)
+
+#WEIGHT_TYPE MAP_WEIGHT a tal proposito, vengono qui utilizzate le mappe di uncertainties invertite e poste al quadrato, come peso
+
+#PHOT_FLUXFRAC 0.5 come da default. Il raggio a 0.9, dovrebbe essere simile al raggio di kron, ovveroa (KRON_RADIUSxA_IMAGE)/<kron_fact>. Va ricordato che il KRON_RADIUS espresso in unità di[A_IMAGE] non è il raggio di Kron, ma è <Kron_fact>x(raggio di Kron). 
+
+#-------------------------------- Catalog ------------------------------------
+ 
+CATALOG_NAME     test.cat       # name of the output catalog
+CATALOG_TYPE     FITS_1.0       # NONE,ASCII,ASCII_HEAD, ASCII_SKYCAT,
+                                # ASCII_VOTABLE, FITS_1.0 or FITS_LDAC
+PARAMETERS_NAME  default.param  # name of the file containing catalog contents
+ 
+#------------------------------- Extraction ----------------------------------
+ 
+DETECT_TYPE      CCD            # CCD (linear) or PHOTO (with gamma correction)
+DETECT_MINAREA   5              # minimum number of pixels above threshold
+THRESH_TYPE      RELATIVE       # threshold type: RELATIVE (in sigmas)
+                                # or ABSOLUTE (in ADUs)
+DETECT_THRESH    1.5            # <sigmas> or <threshold>,<ZP> in mag.arcsec-2
+ANALYSIS_THRESH  1.5            # <sigmas> or <threshold>,<ZP> in mag.arcsec-2
+ 
+FILTER           Y              # apply filter for detection (Y or N)?
+FILTER_NAME /home/baronchelli/SEXTRACTOR/config/gauss_2.5_5x5.conv  # name of the file containing the filter
+FILTER_THRESH                   # Threshold[s] for retina filtering
+ 
+DEBLEND_NTHRESH  32             # Number of deblending sub-thresholds
+DEBLEND_MINCONT  0.005          # Minimum contrast parameter for deblending
+ 
+CLEAN            Y              # Clean spurious detections? (Y or N)?
+CLEAN_PARAM      1.0            # Cleaning efficiency
+
+MASK_TYPE        CORRECT        # type of detection MASKing: can be one of
+                                # NONE, BLANK or CORRECT
+ 
+#-------------------------------- WEIGHTing ----------------------------------
+
+WEIGHT_TYPE      MAP_WEIGHT     # type of WEIGHTing: NONE, BACKGROUND,
+                                # MAP_RMS, MAP_VAR or MAP_WEIGHT
+WEIGHT_IMAGE     /home/baronchelli/cartella_lavoro/SEP/IRAC_src_extrct/80039.0.irac.1.mosaic_unc_invrtd.fits   # weight-map filename
+WEIGHT_GAIN      N              # modulate gain (E/ADU) with weights? (Y/N)
+WEIGHT_THRESH                   # weight threshold[s] for bad pixels
+
+#-------------------------------- FLAGging -----------------------------------
+
+FLAG_IMAGE       flag.fits      # filename for an input FLAG-image
+FLAG_TYPE        OR             # flag pixel combination: OR, AND, MIN, MAX
+                                # or MOST
+
+#------------------------------ Photometry -----------------------------------
+ 
+PHOT_APERTURES   8,12,20,40  # MAG_APER aperture diameter(s) in pixels
+PHOT_AUTOPARAMS  2.5, 3.5       # MAG_AUTO parameters: <Kron_fact>,<min_radius>
+PHOT_PETROPARAMS 2.0, 3.5       # MAG_PETRO parameters: <Petrosian_fact>,
+                                # <min_radius>
+PHOT_AUTOAPERS   0.0,0.0        # <estimation>,<measurement> minimum apertures
+                                # for MAG_AUTO and MAG_PETRO
+PHOT_FLUXFRAC    0.5            # flux fraction[s] used for FLUX_RADIUS
+
+SATUR_LEVEL      43939.3        # level (in ADUs) at which arises saturation
+
+SATUR_KEY        SATURATE       # keyword for saturation level (in ADUs)
+ 
+MAG_ZEROPOINT     8.9           # magnitude zero-point
+#MAG_GAMMA        4.0           # gamma of emulsion (for photographic scans)
+GAIN             1.1x10^8       # detector gain in e-/ADU
+#GAIN_KEY         GAIN          # keyword for detector gain in e-/ADU
+PIXEL_SCALE      0.6            # size of pixel in arcsec (0=use FITS WCS info)
+ 
+#------------------------- Star/Galaxy Separation ----------------------------
+ 
+SEEING_FWHM      1.66           # stellar FWHM in arcsec
+STARNNW_NAME     default.nnw    # Neural-Network_Weight table filename
+ 
+#------------------------------ Background -----------------------------------
+ 
+BACK_TYPE        AUTO           # AUTO or MANUAL
+BACK_VALUE       0.0            # Default background value in MANUAL mode
+BACK_SIZE        32             # Background mesh: <size> or <width>,<height>
+BACK_FILTERSIZE  3              # Background filter: <size> or <width>,<height>
+
+BACKPHOTO_TYPE   LOCAL         # can be GLOBAL or LOCAL
+BACKPHOTO_THICK  15             # thickness of the background LOCAL annulus
+BACK_FILTTHRESH  0.0            # Threshold above which the background-
+                                # map filter operates
+ 
+#------------------------------ Check Image ----------------------------------
+ 
+CHECKIMAGE_TYPE  NONE           # can be NONE, BACKGROUND, BACKGROUND_RMS,
+                                # MINIBACKGROUND, MINIBACK_RMS, -BACKGROUND,
+                                # FILTERED, OBJECTS, -OBJECTS, SEGMENTATION,
+                                # or APERTURES
+CHECKIMAGE_NAME  check.fits     # Filename for the check-image
+ 
+#--------------------- Memory (change with caution!) -------------------------
+ 
+MEMORY_OBJSTACK  3000           # number of objects in stack
+MEMORY_PIXSTACK  300000         # number of pixels in stack
+MEMORY_BUFSIZE   1024           # number of lines in buffer
+ 
+#------------------------------- ASSOCiation ---------------------------------
+
+#ASSOC_NAME       sky.list       # name of the ASCII file to ASSOCiate
+#ASSOC_DATA       2,3,4          # columns of the data to replicate (0=all)
+#ASSOC_PARAMS     2,3,4          # columns of xpos,ypos[,mag]
+#ASSOC_RADIUS     2.0            # cross-matching radius (pixels)
+#ASSOC_TYPE       NEAREST        # ASSOCiation method: FIRST, NEAREST, MEAN,
+                                # MAG_MEAN, SUM, MAG_SUM, MIN or MAX
+#ASSOCSELEC_TYPE  MATCHED        # ASSOC selection type: ALL, MATCHED or -MATCHED
+
+#----------------------------- Miscellaneous ---------------------------------
+ 
+VERBOSE_TYPE     NORMAL         # can be QUIET, NORMAL or FULL
+WRITE_XML        N              # Write XML file (Y/N)?
+XML_NAME         sex.xml        # Filename for XML output
+XSL_URL          file:///usr/share/sextractor/sextractor.xsl
+                                # Filename for XSL style-sheet
+NTHREADS          0              # Number of simultaneous threads for
+                                # the SMP version of SExtractor
+                                # 0 = automatic
+
+FITS_UNSIGNED    N              # Treat FITS integer values as unsigned (Y/N)?
+INTERP_MAXXLAG   16             # Max. lag along X for 0-weight interpolation
+INTERP_MAXYLAG   16             # Max. lag along Y for 0-weight interpolation
+INTERP_TYPE      ALL            # Interpolation type: NONE, VAR_ONLY or ALL
+
+#--------------------------- Experimental Stuff -----------------------------
+
+PSF_NAME         default.psf    # File containing the PSF model
+PSF_NMAX         9              # Max.number of PSFs fitted simultaneously
+PSFDISPLAY_TYPE  SPLIT          # Catalog type for PSF-fitting: SPLIT or VECTOR
+PATTERN_TYPE     RINGS-HARMONIC # can RINGS-QUADPOLE, RINGS-OCTOPOLE,
+                                # RINGS-HARMONICS or GAUSS-LAGUERRE
+SOM_NAME         default.som    # File containing Self-Organizing Map weights
