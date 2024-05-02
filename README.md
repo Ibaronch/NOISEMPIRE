@@ -4,8 +4,11 @@ Empirical noise simulator
 Simulates pure noise 2D images given a real ALMA cube or image in input
 A real sky image (same size as reference image) can also be added.
 
-Requires Source Extractor version 2.25.0 (2018-02-08)
-plus some python libraries installed.
+Requirements
+------------
+- Source Extractor version 2.25.0 (2018-02-08)
+- Python 3.7
+- Python non standard packages: astropy, numpy, scipy, matplotlib, cv2, skimage
 
 Call this script as follows:
 $ python noisempire.py config_file.txt
