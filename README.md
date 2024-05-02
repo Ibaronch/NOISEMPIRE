@@ -12,8 +12,8 @@ $ python noisempire.py config_file.txt
 or, if you want to specify the image name in the command line:
 $ python noisempire.py config_file.txt --INPUT_IMAGE input_image.fits
 
-# HELP
 Additional information by calling:
+---------------------------------
 $ python noisempire.py -h
 or 
 $ python noisempire.py --help
