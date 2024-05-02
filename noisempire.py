@@ -1,6 +1,6 @@
 ##############################################
 Name="NOISEMPIRE"
-Version="1.0.0" # Major.Minor.Patch sequence. When a major, minor, or patch update is made, the corresponding number is increased.
+Version="1.0.1" # Major.Minor.Patch sequence. When a major, minor, or patch update is made, the corresponding number is increased.
 Years="2023-2024"
 Developer="Ivano Baronchelli"
 
@@ -20,19 +20,9 @@ Developer="Ivano Baronchelli"
 ###################################################################
 # Versioning 
 ###################################################################
-# v4
-# read parameters from a Configuration file or from command line
-#
-# v3
-# Added functionality:
-# --> compute noise from a reference image and put it into a working image
-# While the reference image is mandatory, the second one is optional
-#
-# v2
-# changed deprecated forms 
-# np.str --> str()
-# np.float --> float()
-
+# V1.0.0 --> V1.0.1
+# removed duplicated import (re)
+# removed misleading comments 
 
 # Major version changes are related to incompatible API changes.
 # Minor version changes are related to adding new functionality in a backward-compatible manner.
@@ -49,7 +39,6 @@ from pdb import set_trace as stop # in this way you can just write stop() to sto
 import os
 import sys
 from astropy.io import fits
-import re
 import numpy as np
 from astropy.wcs import WCS
 from scipy.optimize import curve_fit
