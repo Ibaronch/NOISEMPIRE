@@ -1,7 +1,7 @@
 # NOISEMPIRE
 Empirical noise simulator
 
-Simulates pure noise 2D images given a real ALMA cube or image in input
+Simulates pure noise 2D images given a real ALMA cube or image in input. 
 A real sky image (same size as reference image) can also be added.
 
 Requirements
