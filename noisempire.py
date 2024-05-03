@@ -1,6 +1,6 @@
 ##############################################
 Name="NOISEMPIRE"
-Version="1.0.1" # Major.Minor.Patch sequence. When a major, minor, or patch update is made, the corresponding number is increased.
+Version="1.0.2" # Major.Minor.Patch sequence. When a major, minor, or patch update is made, the corresponding number is increased.
 Years="2023-2024"
 Developer="Ivano Baronchelli"
 
@@ -20,9 +20,13 @@ Developer="Ivano Baronchelli"
 ###################################################################
 # Versioning 
 ###################################################################
+# V1.0.1 --> V1.0.2 May 3 2024
+#  - corrected bug (arising flattening cubes problem when extracting radial - elliptical patterns) 
+#    
+#
 # V1.0.0 --> V1.0.1 May 2 2024
-# removed duplicated import (re)
-# removed misleading comments 
+#  - removed duplicated import (re)
+#  - removed misleading comments 
 
 # Major version changes are related to incompatible API changes.
 # Minor version changes are related to adding new functionality in a backward-compatible manner.
@@ -1829,7 +1833,7 @@ def main():
 
     ## SIMULATE NOISE + REAL SKY
     # Case 6
-    # python noisempire4.py  default_config.txt --INPUT_IMAGE=TEST_imgs/uid___A002_Xef4e78_X19df.ms.split.cal.J0215-0222_B3.pseudocont.sc.fits --REAL_SKY_IMAGE=/home/baronchelli/cartella_lavoro/BRAIN_Study/Noise_sim/Test_imgs_From_Michele/test4/gaussian_simulations/clean_cube_6.fits
+    # python noisempire.py  default_config.txt --INPUT_IMAGE=TEST_imgs/uid___A002_Xef4e78_X19df.ms.split.cal.J0215-0222_B3.pseudocont.sc.fits --REAL_SKY_IMAGE=/home/baronchelli/cartella_lavoro/BRAIN_Study/Noise_sim/Test_imgs_From_Michele/test4/gaussian_simulations/clean_cube_6.fits
     ##
 
     # --------------------------/
@@ -2540,7 +2544,8 @@ def main():
         # Needed to set the inputs of "rad_bck_img()".
         #--------------------------------------
         # Image radius in pixels
-        img_radius_pix=np.size(data_nosrcs_bck3_HF_sub[0,0,:,0]+data_nosrcs_bck3_HF_sub[0,0,0,:])//2
+        #img_radius_pix=np.size(data_nosrcs_bck3_HF_sub[0,0,:,0]+data_nosrcs_bck3_HF_sub[0,0,0,:])//2
+        img_radius_pix=np.size(data_nosrcs_bck3_HF_sub[:,0]+data_nosrcs_bck3_HF_sub[0,:])//2
         # Image circumference in pixels
         img_circ_pix=2.*np.pi*img_radius_pix
         #---------------------------------------
