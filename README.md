@@ -1,4 +1,4 @@
-# NOISEMPIRE
+# NOISEMPIRE 1.0.3 Platani
 Empirical noise simulator
 
 Simulates pure noise 2D images given a real ALMA cube or image in input.  
@@ -139,4 +139,10 @@ simulated image with noise at pixels-scale only
 sim_tmp_Flat_PSFscale_noise_imagename.fits  
 simulated flat image (temporary file not to be considered)
 
+# History
+V1.0.1 --> V1.0.2 May 3 2024
+- corrected bug (arising flattening cubes problem when extracting radial - elliptical patterns)   
+V1.0.0 --> V1.0.1 May 2 2024
+- removed duplicated import (re)
+- removed misleading comments 
 
