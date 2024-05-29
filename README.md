@@ -31,9 +31,7 @@ This is a complete list of all the outputs produced (some of them can be obtaine
 
 MAIN IMAGE COMPONENTS (noise, sources, rms etc.)
 ------------------------------------------------
-
-
-#Original image background - large scale
+Original image background - large scale
 bck1_imagename.fits
 
 Original image background - small scale
