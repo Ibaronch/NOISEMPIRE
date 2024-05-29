@@ -31,34 +31,34 @@ This is a complete list of all the outputs produced (some of them can be obtaine
 
 MAIN IMAGE COMPONENTS (noise, sources, rms etc.)
 ------------------------------------------------
-Original image background - large scale
+Original image background - large scale 
 bck1_imagename.fits
 
-Original image background - small scale
+Original image background - small scale 
 bck2_imagename.fits
 
-Original image after all noise patterns are subtracted
+Original image after all noise patterns are subtracted 
 Flat_noise_imagename.fits
 
-High frequency Noise patterns isolated from the original image
+High frequency Noise patterns isolated from the original image 
 HFN_imagename.fits
 
-simulated PSF of the input image
+simulated PSF of the input image 
 PSF_sim_imagename.fits
 
-rms map of the input image
+rms map of the input image 
 rms1_imagename.fits
 
-sources identified in the original image (step 1 - mostly point like)
+sources identified in the original image (step 1 - mostly point like) 
 srcs_only1_imagename.fits
 
-sources identified in the original image (step 2 - point like and more extended components)
+sources identified in the original image (step 2 - point like and more extended components) 
 srcs_only2_imagename.fits
 
-Elliptical (PSF-like patterns) isolated from the original image
+Elliptical (PSF-like patterns) isolated from the original image 
 Elliptical_Patterns_imagename.fits
 
-Radial patterns isolated from the original image
+Radial patterns isolated from the original image 
 Radial_Patterns_imagename.fits
 
 
