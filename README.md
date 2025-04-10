@@ -1,4 +1,4 @@
-# NOISEMPIRE 1.0.2 Noce
+# NOISEMPIRE 1.0.3 Noce
 Empirical noise simulator
 
 Simulates pure noise 2D images given a real ALMA cube or image in input.  
