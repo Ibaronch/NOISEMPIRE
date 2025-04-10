@@ -1,4 +1,4 @@
-# NOISEMPIRE 1.0.2 Platani
+# NOISEMPIRE 1.0.3 Noce
 Empirical noise simulator
 
 Simulates pure noise 2D images given a real ALMA cube or image in input.  
@@ -8,15 +8,16 @@ Requirements
 ------------
 - Source Extractor version 2.25.0 (2018-02-08)
 - Python 3.7
-- Python non standard packages: astropy, numpy, scipy, matplotlib, cv2, skimage
+- Python non standard packages: pbd, astropy, numpy, scipy, matplotlib, math, cv2, skimage, re, argparse 
 
 Call this script as follows:
 ----------------------------
 $ python noisempire.py config_file.txt  
-or, if you want to specify the image name in the command line:  
-$ python noisempire.py config_file.txt --INPUT_IMAGE input_image.fits  
+If you want, you can specify some/all the parameters from command line (they will take precedence over those in the config file:  
+Example:
+$ python noisempire.py config_file.txt --INPUT_IMAGE=input_image.fits --REAL_SKY_IMAGE=real_sky.fits --DEBUG=False
 
-Examples of input images and real sky are provided for test run.
+Examples of input images and real sky are provided for a test run.
 
 Additional information by calling:
 ---------------------------------
@@ -25,9 +26,11 @@ $ python noisempire.py -h
 or  
 $ python noisempire.py --help  
 
+The default configuration file is self-explanatory, and it is recommended to read it before using noisempire.
+
 OUTPUTS
 --------------------------
-This is a complete list of all the outputs produced (some of them can be obtained using the DEBUG option)
+This is a complete list of all the outputs produced (some of them can be obtained ONLY using the DEBUG option)
 
 MAIN IMAGE COMPONENTS (noise, sources, rms etc.)
 ------------------------------------------------
@@ -139,6 +142,26 @@ simulated flat image (temporary file not to be considered)
 sim_tmp_Flat_PSFscale_noise_imagename.fits  
 
 # History
+
+V1.0.2 --> V1.0.3
+- noisempire can now properly treat images with odd sizes (the high frequency patterns
+   were not correctly computed before)
+- noisempire can now properly work on rectangular images (it couldn't before due to some
+   little bugs
+- NaN and repeated pixels are masked in the original image, at the beginning of the process
+   A "non problematic" image is computed (IMG_NP in the configuration file).
+   The process ignores areas occupied by "problematic" pixels. 
+- Pixels below MIN_VAL are considered as problematic and masked pefore processing
+- Pixels above MAX_VAL are considered as problematic and masked pefore processing
+- The image parameters (Pixel scale and Beam shape) can be read directly from the header or they
+      can be provided by the user
+- A prefix specified by the user is addedd to all the images created (parameter ALL_IMG_PREFIX)
+- only selected images are saved, unless DEBUG option is active (list specified inside the configuration file)
+- Parameter IMG_ELL_PATT replaced by IMG_ELL
+- Parameter IMG_RAD_PATT replaced by IMG_RAD
+- Execution time is measured and printed at the end of the process
+- Some little bugs corrected
+
 V1.0.1 --> V1.0.2 May 3 2024
 - corrected bug (arising flattening cubes problem when extracting radial - elliptical patterns)
 

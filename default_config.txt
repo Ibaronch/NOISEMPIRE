@@ -1,5 +1,6 @@
 #######################################
-# Configuration file for sim_noise.py
+# Configuration file for noisempire.py
+# V1.0.3
 # Ivano Baronchelli 2024
 #######################################
 # Any parameter specified in the command line 
@@ -8,7 +9,7 @@
 #
 ########################################
 # Input image
-INPUT_IMAGE ./TEST_imgs/uid___A002_Xb88fca_X7028.ms.split.cal.J1319-1217_B3.pseudocont.sc.fits
+INPUT_IMAGE ./TEST_imgs/uid___A002_Xef4e78_X19df.ms.split.cal.J0215-0222_B3.pseudocont.sc.fits
 
 # Working directory. Simulated images, temporary files and other stuff is put here 
 WORKDIR                 ./TEST_imgs/
@@ -17,6 +18,7 @@ WORKDIR                 ./TEST_imgs/
 SHOW_PLOT               False
 
 # outputs additional images.fits for debugging purposes (True/False)
+# and stops at the end of the process (python debugging mode "pdb.set_trace")
 DEBUG                   False
 
 ##################################################
@@ -26,12 +28,84 @@ DEBUG                   False
 # Real sky image (if not indicated or "None", no real sky will be added)
 REAL_SKY_IMAGE          None
 
-# Approximate significance of the detection
+# Approximate significance of the resulting detection
 NSIGMA_RSKY             3.0
+
+##################################################
+# IMAGE PARAMETERS
+##################################################
+# Read image parameters:
+# - from the image's header (header). In this case keyword names must be specified
+# - from parameters provided by the user below (user)
+IMG_PARAMS   	    User #Header
+
+#---------------------------------------------------------------
+# Get parameters from Header (specify the names of the appropriate keywords below)
+#---------------------------------------------------------------
+# Pixel scale along x [deg/pixel] - header's keyword to be read
+CDELT1_KEY    	    CDELT1
+
+# Pixel scale along y [deg/pixel] - header's keyword to be read
+CDELT2_KEY    	    CDELT2
+
+# Beam FWHM along major axis [deg] - header's keyword to be read
+BMAJ_KEY    	    BMAJ
+
+# Beam FWHM along minor axis [deg] - header's keyword to be read
+BMIN_KEY    	    BMIN
+
+# Beam position angle [deg] - header's keyword to be read
+BPA_KEY		    BPA
+#---------------------------------------------------------------
+
+#---------------------------------------------------------------
+# Provide the following parameters if IMG_PARAMS is set to "header"
+#---------------------------------------------------------------
+# Pixel scale along x [deg/pixel]
+USER_CDELT1	      	  0.000680556 # 0.000277778
+
+# Pixel scale along y [deg/pixel]
+USER_CDELT2	      	  0.000680556 # 0.000277778
+
+# Beam FWHM along major axis [deg]
+USER_BMAJ   	    	  0.001905556 # 0.00138889
+
+# Beam FWHM along minor axis [deg]
+USER_BMIN   	    	  0.001905556 # 0.00138889
+
+# Beam position angle [deg]
+USER_BPA    		    0
+#---------------------------------------------------------------
+
+#---------------------------------------------------------------
+# Other parameters
+#---------------------------------------------------------------
+# Minimum Value to be considered in the image (set an appropriate value or leave to None)
+MIN_VAL	  	-10 # None
+
+# Maximum Value to be considered in the image (set an appropriate value or leave to None)
+# Example: set it to the saturation value or to the minimum weird border value.
+# IMPORTANT NOTE: in this case saturated sources will be considered as corrupted regions (not to be considered) during the process
+MAX_VAL	  	40 # None
+#---------------------------------------------------------------
+
 
 ##################################################
 # RADIAL AND ELLIPTICAL PATTERNS
 ##################################################
+
+# Isolate and remove the radial patterns component from 
+# the original image. They are added back into the simulated image
+# The parameter "IMG_RAD" must be set to True in order to save
+# the image of the radial patterns into a file.
+RAD_PATT_ISOLATE        False
+
+# Isolate and remove the elliptical (PSF_shaped) patterns 
+# component from the original image. They are added back
+# into the simulated image. The parameter "IMG_ELL" must
+# be set to True in order to save the image of the elliptical
+# patterns into a file.
+ELL_PATT_ISOLATE        False
 
 # Scale length over which the radial and/or elliptical 
 # patterns are computed. Measured in units of image (maximum) FWHM
@@ -42,33 +116,21 @@ REP_STRIP_LENGTH  6.0
 # where the pixel values are larger than REP_THRESH times the 
 # dispersion computed over a square, with similar area, 
 # centered in the same position. Default ~ 1.0
-REP_THRESH 1.0
-
-# Isolate and remove the radial patterns component from 
-# the original image. They are added back into the simulated image
-RAD_PATT_ISOLATE        False
-
-# save Radial patterns image (True/False)
-IMG_RAD_PATT            False
-
-# Isolate and remove the elliptical (PSF_shaped) patterns 
-# component from the original image. They are added back
-# into the simulated image
-ELL_PATT_ISOLATE        False
-
-# Save elliptical patterns image (True/False) 
-IMG_ELL_PATT            False
-
+REP_THRESH  0
 
 ##################################################
 # Simulated pixel-scale noise convolved with: 
-# PSF --> PSF
-# local_ACF --> local noise auto-correlation function
-# ACF --> Global noise auto-correlation function, or
-# PSF_&_local_ACF--> PSF & local noise auto-correlation function
+# "A" or "PSF" --> PSF
+# "B" or "LOCAL_ACF" --> local noise auto-correlation function
+# "C" or "ACF" --> Global noise auto-correlation function, or
+# "D" or "PSF_&_LOCAL_ACF" --> PSF & local noise auto-correlation function
 ##################################################
-NOISE_CONV PSF_&_local_ACF
+NOISE_CONV PSF_&_LOCAL_ACF
 ##################################################
+
+################################################
+# Background - original or simulate
+################################################
 
 # Background Large scale (Original or Simulate)
 BCK1_TYPE Simulate
@@ -84,5 +146,104 @@ SEX_FOLDER      ./SEx_config/
 
 # Maximum scale (in units FWHM) at which the high frequency patters
 # are isolated. Default should be ~1.0 - 1.2. Above this threshold, 
-# are cancelled out.
-HFN_SCALE     1.2 
+# patterns are not isolated.
+HFN_SCALE        1.2
+
+
+################################################
+# Output images PREFIX
+################################################
+# NAMES ARE GIVEN FOLLOWING THIS SCHEME:
+# ALL_IMG_PREFIX + IMG_PREFIX + ORIGINAL_IMAGE_NAME
+################################################
+# Prefix attached before ALL the output image names created (nothing added if None)
+ALL_IMG_PREFIX     test_
+
+################################################
+# Output images to be saved
+################################################
+# Select here below images to be saved (True) or not (False) at the end of the process.
+
+#-----------------------------------------------
+# MAIN OUTPUTS
+#-----------------------------------------------
+# Main outputs - simulations
+
+# Main output (Simulated image - noise only)
+IMG_SIM		True
+
+# Main output (Simulated image - noise + Real sky)
+# Computed only if REAL_SKY_IMAGE is set to an existing Real sky image
+IMG_SIM1        True
+#-----------------------------------------------
+
+#-----------------------------------------------
+# ORIGINAL COMPONENTS AND PATTERNS
+#-----------------------------------------------
+# Components isolated from the input image
+
+# Flattened input cube (identical to input image if this one is already flat i.e., not a cube)
+IMG_FLC	    	True
+
+# Flattened image with problematic pixels removed (NP=Non Problematic)
+IMG_NP	    	True
+
+# Original image background - large scale
+# (bck1_imagename.fits)
+IMG_BCK1	True
+
+# Original image background - small scale
+# (bck2_imagename.fits)
+IMG_BCK2	True
+
+# High frequency Noise patterns isolated from the original image
+# (HFN_imagename.fits)
+IMG_HFN		True
+
+# Original image after all noise patterns are subtracted
+# (Flat_noise_imagename.fits)
+IMG_FLAT_NOISE	True
+
+# modeled PSF of the input image
+# (PSF_sim_imagename.fits)
+IMG_PSF		True
+
+# rms map of the input image
+# (rms1_imagename.fits)
+IMG_RMS		True
+
+# sources identified in the original image (step 1 - mostly point like)
+# (srcs_only1_imagename.fits)
+IMG_SRCS1	True
+
+# sources identified in the original image (step 2 - point like and more extended components)
+# (srcs_only2_imagename.fits)
+IMG_SRCS2	True
+
+# Elliptical (PSF-like patterns) isolated from the original image
+# (Elliptical_Patterns_imagename.fits)
+# Note: This parameter only allows the user to compute the
+#       elliptical patterns found in the original image. In order
+#       to actually isolate them and add them to the simulated
+#       image, ELL_PATT_ISOLATE must be set to True
+IMG_ELL		False
+
+# Radial patterns isolated from the original image
+# (Radial_Patterns_imagename.fits)
+# Note: This parameter only allows the user to compute the
+#       radial patterns found in the original image. In order
+#       to actually isolate them and add them to the simulated
+#       image, RAD_PATT_ISOLATE must be set to True
+IMG_RAD		False
+
+#-----------------------------------------------
+# SIMULATED COMPONENTS AND PATTERNS
+#-----------------------------------------------
+
+# Simulated image background - large scale
+# (sim_bck1_imagename.fits). Computed only if BCK1_TYPE is set to "Simulate"
+IMG_SIM_BCK1	True
+
+# Simulated image background - small scale
+# (sim_bck2_imagename.fits). Computed only if BCK2_TYPE is set to "Simulate"
+IMG_SIM_BCK2	True
