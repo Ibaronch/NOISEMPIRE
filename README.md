@@ -145,14 +145,17 @@ sim_tmp_Flat_PSFscale_noise_imagename.fits
 
 V1.0.2 --> V1.0.3
 - noisempire can now properly treat images with odd sizes (the high frequency patterns
-   were not correctly computed before)
+   were not correctly computed before, in these cases).
 - noisempire can now properly work on rectangular images (it couldn't before due to some
-   little bugs
+   little bugs)
 - NaN and repeated pixels are masked in the original image, at the beginning of the process
    A "non problematic" image is computed (IMG_NP in the configuration file).
    The process ignores areas occupied by "problematic" pixels. 
 - Pixels below MIN_VAL are considered as problematic and masked pefore processing
 - Pixels above MAX_VAL are considered as problematic and masked pefore processing
+- The background at large and small scales is now simulated keeping into account possible underlying
+   patterns at these same scales. These patterns are detected/measured computing the ACF at different
+   scales, zooming out the original backgorund image.
 - The image parameters (Pixel scale and Beam shape) can be read directly from the header or they
       can be provided by the user
 - A prefix specified by the user is addedd to all the images created (parameter ALL_IMG_PREFIX)
