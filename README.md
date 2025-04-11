@@ -75,70 +75,70 @@ sim_imagename.fits
 OTHER OUTPUTS
 -------------
 
-original image subtracted of background on large scale and high frequency patterns
+original image subtracted of background on large scale and high frequency patterns  
 bck1_HF_sub_imagename.fits  
 
-original image subtracted of background on large scale
+original image subtracted of background on large scale  
 bck1_sub_imagename.fits  
 
-original cube flattened to a 2D image
+original cube flattened to a 2D image  
 FLAT_imagename.fits  
 
-original image subtracted of sources, background on large scale and high frequency patterns
+original image subtracted of sources, background on large scale and high frequency patterns  
 nosrcs_bck1_HF_sub_imagename.fits  
 
-original image subtracted of sources, background on small and large scale, high frequency patterns and Radial and/or elliptical patterns (REP)
+original image subtracted of sources, background on small and large scale, high frequency patterns and Radial and/or elliptical patterns (REP)  
 nosrcs_bck3_HF_REP_sub_imagename.fits  
 
-original image subtracted of sources, background on large scale and high frequency patterns
+original image subtracted of sources, background on large scale and high frequency patterns  
 nosrcs_bck3_HF_sub_imagename.fits  
 
-original image subtracted of sources, background on large and small scales
+original image subtracted of sources, background on large and small scales  
 nosrcs_bck3_sub_imagename.fits  
 
-original image subtracted of sources and high frequency patterns
+original image subtracted of sources and high frequency patterns  
 nosrcs_HF_sub_imagename.fits  
 
-original image subtracted of sources only
+original image subtracted of sources only  
 nosrcs_patch_bck_imagename.fits  
 
-original image subtracted of sources and large scale background
+original image subtracted of sources and large scale background  
 nosrcs_patch_imagename.fits  
 
-original image subtracted of large scale background and sources set to 0.
+original image subtracted of large scale background and sources set to 0.  
 nosrcs_imagename.fits  
 
-simulated background on large scale (if BCK1_TYPE Simulate)
+simulated background on large scale (if BCK1_TYPE Simulate)  
 sim_bck1_imagename.fits  
 
-simulated background on small scale (if BCK2_TYPE Simulate)
+simulated background on small scale (if BCK2_TYPE Simulate)  
 sim_bck2_imagename.fits  
 
-simulated image with noise at PSF scale, noise small scale subtracted  (temporary file not to be considered)
+simulated image with noise at PSF scale, noise small scale subtracted  (temporary file not to be considered)  
 sim_bck_sub_tmp2_imagename.fits  
 
-simulated image background on small scale (temporary file not to be considered)
+simulated image background on small scale (temporary file not to be considered)  
 sim_bck_tmp_imagename.fits  
 
-simulated flat image with noise at PSF scale 
+simulated flat image with noise at PSF scale   
 sim_Flat_PSFscale_noise_imagename.fits  
 
-simulated noise and background (no HF patterns yet)
+simulated noise and background (no HF patterns yet)  
 sim_noise_and_bck_imagename.fits  
 
-simulated noise, background and HF patterns
+simulated noise, background and HF patterns  
 sim_noise_bck_HFN_imagename.fits  
 
-xxxxx
-sim_nosrcs_nobck_noHF_imagename.fits  
+xxxxx  
+sim_nosrcs_nobck_noHF_imagename.fits    
 
-simulated image with noise at PSF scale remodulated using the true rms of the original image
+simulated image with noise at PSF scale remodulated using the true rms of the original image  
 sim_PSFscale_noise_imagename.fits  
 
-simulated image with noise at pixels-scale only
+simulated image with noise at pixels-scale only  
 sim_Pixscale_noise_imagename.fits  
 
-simulated flat image (temporary file not to be considered)
+simulated flat image (temporary file not to be considered)  
 sim_tmp_Flat_PSFscale_noise_imagename.fits  
 
 # History
