@@ -1,4 +1,4 @@
-# NOISEMPIRE 1.0.4 Belicece
+# NOISEMPIRE 1.0.4 Belice
 DOI:
 Empirical noise simulator
 
