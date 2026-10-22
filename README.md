@@ -1,5 +1,5 @@
-# NOISEMPIRE 1.0.3 Noce
-DOI: 10.5281/zenodo.21418287 
+# NOISEMPIRE 1.0.4 Belicece
+DOI:
 Empirical noise simulator
 
 Simulates pure noise 2D images given a real ALMA cube or image in input.  
@@ -7,7 +7,7 @@ A real sky image (same size as reference image) can also be added.
 
 Requirements
 ------------
-- Source Extractor version 2.25.0 (2018-02-08)
+- Source Extractor version 2.28.0
 - Python 3.7
 - Python non standard packages: pbd, astropy, numpy, scipy, matplotlib, math, cv2, skimage, re, argparse 
 
