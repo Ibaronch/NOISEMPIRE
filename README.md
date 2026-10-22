@@ -25,7 +25,7 @@ A configuration file is mandatory. Run the program with:
 python noisempire.py config_file.txt
 ```
 
-All configuration parameters can also be specified on the command line. Non-empty command-line options override selected values in the configuration file.For example:
+All configuration parameters can also be specified on the command line. Non-empty command-line options override selected values in the configuration file. For example:
 
 ```bash
 python noisempire.py config_file.txt --INPUT_IMAGE=/path/to/input_image.fits --DEBUG=False
@@ -69,11 +69,11 @@ The following products are controlled by the output parameters in the configurat
 | Product | Contents |
 | --- | --- |
 | `<ALL_IMG_PREFIX>sim_0_<input_filename>` | Simulated noise/background without the input's detected source population. Radial and/or elliptical patterns are included if their restoration options are enabled. Controlled by `IMG_SIM`. |
-| `sim_1_<ALL_IMG_PREFIX><input_filename>` | Simulated noise plus the optional real-sky image, convolved with the synthesized PSF and scaled using `NSIGMA_RSKY`. Requires `REAL_SKY_IMAGE` and the relevant output options. Controlled by `IMG_SIM1`. |
+| `<ALL_IMG_PREFIX>sim_1_<input_filename>` | Simulated noise plus the optional real-sky image, convolved with the synthesized PSF and scaled using `NSIGMA_RSKY`. Requires `REAL_SKY_IMAGE` and the relevant output options. Controlled by `IMG_SIM1`. |
 | `<ALL_IMG_PREFIX>sim_2_<input_filename>` | Simulated noise, any real-sky component added to the run, and the optional injected source population. Written when source injection is enabled and `IMG_SIM2=True`. |
 | `<ALL_IMG_PREFIX>sim_2_input_cat_<input_basename>.txt` | Catalog of injected sources, written when `ADD_SIM_SOURCES=True`. Columns are RA, Dec, pixel X/Y, flux, significance, size in PSF units, axis ratio, and position angle (PA). |
 
-`ALL_IMG_PREFIX` is applied to most output names. The current code places it before `sim_0_` and `sim_2_`, while the `sim_1_` product is named `sim_1_<ALL_IMG_PREFIX><input_filename>`, as shown in the table.
+`ALL_IMG_PREFIX` is applied to the output names. The current code places it before `sim_0_` and `sim_2_`.
 
 ## Component and analysis images
 
