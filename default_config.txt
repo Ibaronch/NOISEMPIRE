@@ -1,18 +1,30 @@
 #######################################
 # Configuration file for noisempire.py
-# V1.0.3
-# Ivano Baronchelli 2024
+# V1.0.4
+# Ivano Baronchelli 2025
 #######################################
 # Any parameter specified in the command line 
 # will override those from the configuration file."
 # 
 #
 ########################################
+
+########################################
+# Input files - paths and names
+########################################
+
 # Input image
 INPUT_IMAGE ./TEST_imgs/uid___A002_Xef4e78_X19df.ms.split.cal.J0215-0222_B3.pseudocont.sc.fits
 
 # Working directory. Simulated images, temporary files and other stuff is put here 
 WORKDIR                 ./TEST_imgs/
+
+# SExtractor configuration files folder
+SEX_FOLDER      ./SEx_config/
+
+########################################
+# Debugging and additional runtime information
+########################################
 
 # See plots during processing (True/False)
 SHOW_PLOT               False
@@ -25,19 +37,89 @@ DEBUG                   False
 # Real sky to be added to the simulation
 ##################################################
 
-# Real sky image (if not indicated or "None", no real sky will be added)
+# Real sky image path (if not indicated or "None", no real sky will be added)
 REAL_SKY_IMAGE          None
 
 # Approximate significance of the resulting detection
 NSIGMA_RSKY             3.0
 
+
 ##################################################
-# IMAGE PARAMETERS
+# Simulated sources to be added to the simulation
+##################################################
+
+# Set to True if simulated sources need to be added.
+# Note: if a real sky image is also provided, both the real sky image and
+# the simulated sources will be added to the simulated noise
+ADD_SIM_SOURCES True
+
+# Simulation method:
+# "AUTO" will automatically draw a distribution of sources similar to that characterizing the
+#        input image
+# "USER" option allows the user to set some specific paramters to adjust the simulation itself.
+#        With the USER option the user can set the relation between flux and size of the input
+#        sources, number of injected sources, minimum and maximum fluxes and sizes.
+SRCS_SIM_METHOD AUTO # USER
+
+# =============================================================
+# AUTO MODE (learn flux & size distributions from real catalog)
+# =============================================================
+# Simulation will be performed including sources extracted down to SIM_REF_DEPTH sigmas.
+SIM_REF_DEPTH 3.0
+
+# =============================================================
+# --- METHOD 2: USER — fixed analytic input parameters --------
+# =============================================================
+
+# Number of simulated sources to add
+N_SIM_SRCS 3000
+
+# Minimum flux of the simulated sources [in units of underlying noise sigma]
+SIM_SRCS_SIGMA_MIN 3.0
+
+# Maximum flux of the simulated sources [in units of underlying noise sigma]
+SIM_SRCS_SIGMA_MAX 100000.0
+
+# Simulated number counts slope, considering dN/dS ~ S^-alpha
+# Larger values of SIM_POWER_LAW_IDX implies a larger amount
+# of faint sources
+# - Euclidean non-evolving Universe (field galaxies)--> 2.5
+# - cluster field --> ~ 1.5 - 2.0
+SIM_POWER_LAW_IDX 1.7 # 2.5
+
+# Minimum size of the injected sources in units of the PSF (1.0 = input PSF)
+SIM_SRCS_SIZE_MIN 1.0
+
+# Maximum size factor (e.g. 3x broader than input PSF)
+SIM_SRCS_SIZE_MAX 20
+
+#----------------------------------------------------------------------
+# FLux - size relation
+# S = S_min + (S_max-S_min) x {[(F-F_min)/(F_max-F_min)]^beta} x scatter
+# with scatter=exp(0 ± sigma)
+#----------------------------------------------------------------------
+
+# Correlation strength beta (higher --> stronger flux-size link). It controls the
+#  systematic trend: how strongly size grows with flux on average.
+#  0 --> no trend, all sources have nearly the same size.
+#  1 --> sizes scale steeply with flux.
+SIM_SRCS_BETA 0.5
+
+# Sigma in the lognormal scatter. Controls the spread around that trend at fixed flux.
+#  Small sigma (~0.1) --> tight relation (all bright sources have nearly the same size).
+#  Large sigma (~2.0) --> flux-size relation almost meaningles
+#  In log10 terms: 0.3/ln⁡(10)≈0.130.3/ln(10)≈0.13 dex scatter.
+#  In log10 terms: 1.0/ln⁡(10)≈0.431.0/ln(10)≈0.43 dex scatter.
+SIM_SRCS_SIGMA 0.6
+
+
+##################################################
+# INPUT IMAGE PARAMETERS
 ##################################################
 # Read image parameters:
 # - from the image's header (header). In this case keyword names must be specified
 # - from parameters provided by the user below (user)
-IMG_PARAMS   	    User #Header
+IMG_PARAMS   	    user #header
 
 #---------------------------------------------------------------
 # Get parameters from Header (specify the names of the appropriate keywords below)
@@ -81,13 +163,29 @@ USER_BPA    		    0
 # Other parameters
 #---------------------------------------------------------------
 # Minimum Value to be considered in the image (set an appropriate value or leave to None)
-MIN_VAL	  	-10 # None
+MIN_VAL	  	None #-10
 
 # Maximum Value to be considered in the image (set an appropriate value or leave to None)
 # Example: set it to the saturation value or to the minimum weird border value.
 # IMPORTANT NOTE: in this case saturated sources will be considered as corrupted regions (not to be considered) during the process
-MAX_VAL	  	40 # None
+MAX_VAL	  	None #40
 #---------------------------------------------------------------
+
+########################################
+# SUB-IMAGE - CUTOUT - STAMP
+########################################
+# Define the pixel boundaries of a sub-image ("stamp") from the original image.
+# Noisempire will process only this region, reducing runtime and avoiding memory issues with large images.
+CUTOUT	     False
+
+# the next parameters are considered only if CUTOUT is set to True.
+# If a negative value is indicated, the original boundary is considered.
+PIX_X_MIN	4500
+PIX_X_MAX	5500
+PIX_Y_MIN	4500
+PIX_Y_MAX	5500
+########################################
+
 
 
 ##################################################
@@ -125,7 +223,7 @@ REP_THRESH  0
 # "C" or "ACF" --> Global noise auto-correlation function, or
 # "D" or "PSF_&_LOCAL_ACF" --> PSF & local noise auto-correlation function
 ##################################################
-NOISE_CONV PSF_&_LOCAL_ACF
+NOISE_CONV LOCAL_ACF
 ##################################################
 
 ################################################
@@ -139,16 +237,25 @@ BCK1_TYPE Simulate
 BCK2_TYPE Simulate
 
 ################################################
-# The following parameters shoud not be modified
+# INTERNAL PARAMETERS
 ################################################
-# SExtractor configuration files folder
-SEX_FOLDER      ./SEx_config/
+#IMPORTANT NOTE:
+# The parameters in this section shoud not be modified.
+# The software was tested using this set of parameters
+# and changing them may bring to unpredictable results.
 
-# Maximum scale (in units FWHM) at which the high frequency patters
-# are isolated. Default should be ~1.0 - 1.2. Above this threshold, 
-# patterns are not isolated.
+# Maximum spatial scale (in units FWHM) of the
+# high frequency patterns isolated in the input image.
+# Default should be ~1.0 - 1.2 times the PSF's size
+# of the input image.
 HFN_SCALE        1.2
 
+# Threshold in units of sigma, above which large scale
+# background deviations are considered sources residuals
+# and removed. Negative excesses are also removed as
+# bad background subtractions. One standard deviation is
+# computed as the 16th and the 84th percentiles
+LS_BCK_TH_P	4.0
 
 ################################################
 # Output images PREFIX
@@ -169,12 +276,16 @@ ALL_IMG_PREFIX     test_
 #-----------------------------------------------
 # Main outputs - simulations
 
-# Main output (Simulated image - noise only)
+# Save simulated image (Noise only) to a file
 IMG_SIM		True
 
-# Main output (Simulated image - noise + Real sky)
+# Save simulated image (noise + Real sky) to a file
 # Computed only if REAL_SKY_IMAGE is set to an existing Real sky image
 IMG_SIM1        True
+
+# Save simulated image (noise + Real sky + Simulated sources) to a file
+# Computed only if REAL_SKY_IMAGE is set to an existing Real sky image
+IMG_SIM2        True
 #-----------------------------------------------
 
 #-----------------------------------------------
@@ -219,6 +330,21 @@ IMG_SRCS1	True
 # sources identified in the original image (step 2 - point like and more extended components)
 # (srcs_only2_imagename.fits)
 IMG_SRCS2	True
+
+# sources identified in the original image (step 3 - extended components / bck residuals)
+(srcs_only3_imagename.fits)'
+# (srcs_only3_imagename.fits)
+IMG_SRCS3	True
+
+# sources identified in the original image (all the sources identified (compact/extended/bck residuals)
+(srcs_only_imagename.fits)
+IMG_SRCS_ALL	True
+
+# sources identified in the original image using the threshold SIM_REF_DEPTH.
+# These sources are used as a reference to simulate a similar set of sources
+# in the simulated image, if ADD_SIM_SOURCES True and SRCS_SIM_METHOD AUTO.
+(srcs_only_deep_imagename.fits)
+IMG_SRCS_4SIM	True
 
 # Elliptical (PSF-like patterns) isolated from the original image
 # (Elliptical_Patterns_imagename.fits)

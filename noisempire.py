@@ -1,11 +1,11 @@
 #############################################
 Name="NOISEMPIRE"
-Version="1.0.3" # Major.Minor.Patch sequence. When a major, minor, or patch update is made, the corresponding number is increased.
-Years="2023-2024"
+Version="1.0.4" # Major.Minor.Patch sequence. When a major, minor, or patch update is made, the corresponding number is increased.
+Years="2023-2025"
 Developer="Ivano Baronchelli"
 
 ##############################################
-# Simulates a pure noise map using real ALMA images as a reference
+# Simulates a pure noise map using real images as a reference
 # Call this script as follows:
 #########################################
 # $ python noisempire.py config_file.txt
@@ -13,14 +13,36 @@ Developer="Ivano Baronchelli"
 # $ python noisempire.py config_file.txt --INPUT_IMAGE input_image.fits
 #########################################
 #
-# Given an input ALMA image (or flattened cube), it creates a simulated
+# Given an input image (or flattened cube), it creates a simulated
 # image made of pure noise.
 #
-# Ivano Baronchelli 2023-2024
+# Ivano Baronchelli 2023-2025
 ###################################################################
 # Versioning 
 ###################################################################
-# V1.0.2 --> V1.0.3 May 28 2024
+# V1.0.3 --> V1.0.4
+# List of changes:
+# - Instead of convolving random pixel images with the ACF or PSF of the original image now the PSF-scale noise and the background(s) are simulated
+# using the ACF or PSF as a reference but without a convolution process. instead, the new functions deterministic_stamp_from_acf() and random_stamp_from_acf(). These new functions obtain an output image with an ACF identical to the one provided in input without need to convolve with a random pixel image. Drawback: they produce some noise at the pixel scale level that must be removed. - DONE
+# - NOW the small scale background (Bck2) is computed BEFORE computating the high frequency patterns - DONE
+# - Very extended sources (low superficial brightness) are now detected as background excesses - DONE
+# - in the fill_holes() function, beside replacing sources using patches copied from the neighborhoods (method 1),
+#     now holes (sources or background excesses) can also be replaced by patches characterized by the same ACF
+#     as the one that characterize the image in the regions sorrounding the holes (method 2). The global ACF can also be used.
+#   DONE
+# - Deeper source extraction set (4sigma --> 2.5 sigma= also on compact sources - DONE
+# - new output: image with all the sources extracted (compact, extended, very extended/residuals) - DONE
+# - possibility to work on smaller cut-outs of the input image - DONE
+# - improved "patching" after sources removal (function "fill_image_holes") - DONE
+# - Better subtraction of sources and source residuals in the background images (LS and SS) - DONE
+# - possibility of modifying the depth of the extraction - OK BUT ONLY AS AN INTERNAL PARAMETER!
+# - possibility of modifying the scale at which the background is subtracted
+# - possibility to include point like sources to the simulated image
+# - added strategy for the identification of non scientific areas of images. Needed in some cases. DONE
+# - minor bugs corrected DONE
+
+
+# V1.0.2 --> V1.0.3 
 # - noisempire can now properly treat images with odd sizes (the high frequency patterns
 #    were not correctly computed before)
 # - noisempire can now properly work on rectangular images (it couldn't before due to some
@@ -59,35 +81,233 @@ print('              #   '+Developer +' '+Years+'   #')
 print('              ###################################\n\n')
 
 
+import numpy as np
 import pdb # pdb.set_trace() and continue
 from pdb import set_trace as stop # in this way you can just write stop() to stop the program, and "c" or "continue" to continue.
 import os
 import sys
+from astropy.table import Table # reading Sextractor catalogs
 from astropy.io import fits
-import numpy as np
 from astropy.wcs import WCS
+from astropy.stats import sigma_clip # From V1.04 on
+from astropy.stats import sigma_clipped_stats # From V1.04 on
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt # to show plot and images
 import math
 import scipy.signal # for image convolution or to create a 2d Gaussian
-from scipy.fft import fft2, ifft2, fftshift
+from scipy.fft import fft2, ifft2, fftshift, ifftshift
+from astropy.convolution import Gaussian2DKernel, convolve_fft # for the simulated sources (extended)
 from scipy.ndimage import binary_dilation # expand a boolean mask of a few pixels
 import cv2 #("conda install opencv")
 from scipy.ndimage import zoom
+from scipy.ndimage import gaussian_filter # From V1.04 on
+from scipy.ndimage import distance_transform_edt # From V1.04 on
+from scipy.ndimage import rotate # From V1.04 on
+from scipy import stats
 from skimage import measure
 from skimage.transform import rescale
 from skimage.transform import resize
 import re # used to identify variable types
 import argparse # used to pass arguments to main()
+from numpy.lib.stride_tricks import sliding_window_view
+from astropy.stats import sigma_clip 
 
-import numpy as np
+def measure_sigma_random_apertures(image, psf_sigma_pix, n_apertures=5000, mask=None, aperture_factor=3.0):
+    """
+    Measure background sigma using random circular apertures with size based on PSF sigma.
+
+    Parameters
+    ----------
+    image : 2D array
+        Input image.
+    psf_sigma_pix : float
+        PSF sigma in pixels (e.g. FWHM / 2.355).
+    n_apertures : int
+        Number of random apertures to sample.
+    mask : 2D bool array, optional
+        True where pixels should be excluded (e.g. bright sources).
+    aperture_factor : float
+        Radius of aperture in units of PSF sigma (default=3.0 → radius = 3σ).
+
+    Returns
+    -------
+    sigma_ap : float
+        Background sigma measured with circular apertures.
+    """
+
+    ny, nx = image.shape
+    radius = int(np.ceil(aperture_factor * psf_sigma_pix))  # aperture radius in pixels
+    y_grid, x_grid = np.ogrid[-radius:radius+1, -radius:radius+1]
+    aperture_mask = (x_grid**2 + y_grid**2) <= radius**2   # circular aperture
+
+    fluxes = []
+
+    for _ in range(n_apertures):
+        x0 = np.random.randint(radius, nx - radius)
+        y0 = np.random.randint(radius, ny - radius)
+
+        if mask is not None and mask[y0, x0]:
+            continue
+
+        stamp = image[y0-radius:y0+radius+1, x0-radius:x0+radius+1]
+        if stamp.shape != aperture_mask.shape:
+            continue  # skip edges
+
+        flux = np.sum(stamp[aperture_mask])
+        fluxes.append(flux)
+
+    if len(fluxes) == 0:
+        raise ValueError("No valid apertures found — check mask or image size.")
+
+    fluxes = np.array(fluxes)
+    fluxes_clipped = sigma_clip(fluxes, sigma=3.0, maxiters=5)
+    sigma_ap = np.std(fluxes_clipped)
+
+    return sigma_ap
+
+
+def measure_sigma_random_aperturesB(image, psf, n_apertures=5000, mask=None):
+    
+    """
+    Measure background sigma using random PSF-shaped apertures.
+
+    Parameters
+    ----------
+    image : 2D array
+        Input image.
+    psf : 2D array
+        Normalized PSF (sum=1).
+    n_apertures : int
+        Number of random apertures to try.
+    mask : 2D bool array, optional
+        True where pixels should be excluded (e.g. bright sources).
+
+    Returns
+    -------
+    sigma_ap : float
+        Background sigma measured with PSF-shaped apertures.
+    """
+
+    ny, nx = image.shape
+    psf_ny, psf_nx = psf.shape
+    psf_center_y, psf_center_x = psf_ny // 2, psf_nx // 2
+
+    #psf_norm = psf / np.sum(psf)
+    psf_norm = psf / np.max(psf)
+
+    fluxes = []
+    for _ in range(n_apertures):
+        x0 = np.random.randint(psf_nx//2, nx - psf_nx//2)
+        y0 = np.random.randint(psf_ny//2, ny - psf_ny//2)
+
+        if mask is not None and mask[y0, x0]:
+            continue
+
+        y1, y2 = y0 - psf_center_y, y0 + psf_ny - psf_center_y
+        x1, x2 = x0 - psf_center_x, x0 + psf_nx - psf_center_x
+        stamp = image[y1:y2, x1:x2]
+
+        if stamp.shape != psf.shape:
+            continue  # skip edges
+        
+        fluxes.append(np.sum(stamp * psf_norm))
+
+    fluxes = np.array(fluxes)
+    fluxes_clipped = sigma_clip(fluxes, sigma=3.0, maxiters=5)
+    sigma_ap = np.std(fluxes_clipped)
+    return sigma_ap
+
+
+
+def mask_uniform_3x3_members(arr):
+    H, W = arr.shape
+    out_mask = np.zeros_like(arr, dtype=bool)
+
+    # Create sliding 3x3 windows (shape: H-2, W-2, 3, 3)
+    windows = sliding_window_view(arr, (3, 3))
+    uniform_blocks = (windows == windows[:, :, 0:1, 0:1]).all(axis=(2, 3))
+
+    # For each True block, mark its 3x3 region in the output mask
+    # Vectorized marking
+    for i in range(3):
+        for j in range(3):
+            out_mask[i:H-2+i, j:W-2+j] |= uniform_blocks
+
+    return out_mask
+
+
+def replace_with_neighbor_average(arr, target_value):
+    arr = arr.copy()
+    rows, cols = arr.shape
+    
+    # Identify pixels to replace
+    to_replace = (arr == target_value)
+    replace_coords = np.argwhere(to_replace)  # only pixels to replace
+    
+    # Neighbor relative positions (8 directions)
+    neighbors = np.array([
+        [-1, -1], [-1, 0], [-1, 1],
+        [ 0, -1],          [ 0, 1],
+        [ 1, -1], [ 1, 0], [ 1, 1]
+    ])
+    
+    result = arr.copy()
+    
+    for r, c in replace_coords:
+        neighbor_positions = neighbors + np.array([r, c])
+        
+        # Filter neighbors that are inside the image
+        valid_mask = (
+            (neighbor_positions[:,0] >= 0) & (neighbor_positions[:,0] < rows) &
+            (neighbor_positions[:,1] >= 0) & (neighbor_positions[:,1] < cols)
+        )
+        valid_neighbors = neighbor_positions[valid_mask]
+        
+        # Filter neighbors that are NOT to be replaced themselves
+        valid_neighbors = [
+            (nr, nc) for nr, nc in valid_neighbors
+            if arr[nr, nc] != target_value
+        ]
+        
+        if valid_neighbors:
+            neighbor_vals = [arr[nr, nc] for nr, nc in valid_neighbors]
+            result[r, c] = np.mean(neighbor_vals)
+        # else keep original value
+    
+    return result
+
+
+def extract_subimage(data, header, pix_x_min, pix_x_max, pix_y_min, pix_y_max):
+    # Extract s sub-image (stamp) from an input image preserving WCS information
+    # on single pixels (i.e., preserving the correspondence between pixels and
+    # coordinates)
+
+    # Slice the image data
+    sub_data = data[pix_y_min:pix_y_max, pix_x_min:pix_x_max]
+
+    # Create WCS from original header
+    wcs = WCS(header)
+
+    # Adjust CRPIX to new reference pixel
+    wcs.wcs.crpix[0] -= pix_x_min  # CRPIX1
+    wcs.wcs.crpix[1] -= pix_y_min  # CRPIX2
+
+    # Create new header from modified WCS
+    sub_header = wcs.to_header()
+
+    # Optionally copy over additional metadata
+    for key in header:
+        if key not in sub_header and key not in ['COMMENT', 'HISTORY', '', ' ']:
+            sub_header[key] = header[key]
+
+    return sub_data, sub_header
 
 
 def replicate_patterns(input_image, ref_image, SCALE_LOW, SCALE_UP, Sampling=32., LOCALITY='Local', NVN=-99.):
     
     """
     MULTI-SCALE PATTERNS REPLICATOR:
-    It replicates patterns at the most important scales in an image
+    It simulates an input image replicating patterns at the most important scales.
     - ref_image = an image with whose patterns will be replicated 
     - input_image = an image with same shape as the ref_image but with shuffled pixels
                     (but the position of the non valid pixels must remain the same!) 
@@ -194,7 +414,18 @@ def replicate_patterns(input_image, ref_image, SCALE_LOW, SCALE_UP, Sampling=32.
       # 4) Convolve with downsampled background ACF
       #downsamp_sim1=convolve_local_ACF(downsamp_working_img,downsamp_bck1,box_size=ACF_BOX_SIZE,SHOW_PLOT=False, norm_blocks=LOCALITY,shrink_factor=1.0, exclude_val=0, algorithm='FFTC')
       #downsamp_sim1,ACF_HERE=convolve_local_ACF(downsamp_working_img,downsamp_bck1,box_size=ACF_BOX_SIZE,SHOW_PLOT=False, norm_blocks=LOCALITY,shrink_factor=1.0, exclude_val=0., algorithm='FFTC', RETURN_AVERAGE_ACF=True)
-      downsamp_sim1=convolve_local_ACF(downsamp_working_img,downsamp_bck1,box_size=ACF_BOX_SIZE,SHOW_PLOT=False, norm_blocks=LOCALITY,shrink_factor=1.0, exclude_val=0., algorithm='FFTC')
+
+      #XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+      # It is difficult to say which one works better, but probaly convolve_local_ACF() does a better job !
+      # Version 1.0.3 XXXXXXXXXXXXXXXXXXX
+      #downsamp_sim1=convolve_local_ACF(downsamp_working_img,downsamp_bck1,box_size=ACF_BOX_SIZE,SHOW_PLOT=False, norm_blocks=LOCALITY,shrink_factor=1.0, exclude_val=0., algorithm='FFTC')
+      #XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+      # Version 1.0.4 XXXXXXXXXXXXXXXXXXX
+      downsamp_sim1=replicate_image_ACF(downsamp_bck1,box_size=ACF_BOX_SIZE,SHOW_PLOT=False, norm_blocks=LOCALITY,shrink_factor=1.0, exclude_val=0., algorithm='FFTC')
+      HFP_downsamp_sim1=get_hf_patterns(downsamp_sim1,np.round(ACF_BOX_SIZE/4.), show_imgs=False)
+      downsamp_sim1=downsamp_sim1-HFP_downsamp_sim1
+      #XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+      
       # --------------------------------------------------
       # 5 Remove high frequency residual patterns due to local convolution
       # Compute and Remove high frequency patterns from simulated background , i.e. the boxy shapes
@@ -1069,6 +1300,510 @@ def convolve_local_ACF(input_image_in, ref_image_in, box_size=32, SHOW_PLOT=Fals
       average_ACF=average_ACF/np.sum(average_ACF)
       return output_image, average_ACF
 
+
+
+def replicate_image_ACF(ref_image_in, box_size=32, SHOW_PLOT=False, norm_blocks="Global", shrink_factor=1.0, exclude_val=None, algorithm='FFTC', RETURN_AVERAGE_ACF=False):
+
+    """
+    It returns an image with same size as the reference image given
+    in input and characterized the same Auto-Correlation Function (ACF).
+    The ACF is computed on a local scale,
+    by dividing the image in boxes whose size (in pixels)
+    is set by the user using the "box_size" parameter.
+    The function Returns the input image convolved as described
+    - If norm_blocks is set to None or 'No', boxes are not normalized 
+      after the convolution process
+    - If norm_blocks is set to "Global" (default), the distribution
+      of the pixel values inside the boxes are normalized to the same 
+      (percentile-based) stdv and median values measured in the
+      overall ref_image. 
+    - If norm_blocks is set to "Local", the distribution of the 
+      pixel values inside the boxes are normalized to the same 
+      (percentile-based) stdv and median measured in the same box
+      of the reference image
+    
+    Setting shrink_factor, the ACF can be shrinked 
+    (from scipy.ndimage import zoom) to reach
+    the desired granularity of the final image
+     - Set "exclude_val" to the value(s) that should not be
+    included in the computation (such as extreme values that
+    should not be included or repeated non valid values like
+    -99 or 0). For example: exclude_val=(0,-99).
+    NaN values are automatically excluded.
+    - "algorithm" can be used to select the algorithm to be used
+     for computing the autocorrelation function. It can be
+     "CORR", for scipy.signal.correlate2d(), that is more precise
+     but slower, or "FFTC", based on  "scipy.signal.fftconvolve",
+     that is faster but less precise in some cases.
+     FFTC might introduce slight edge effects,
+    - if Return_AVERAGE_ACF is set to True (Default is False), an
+    average ACF is returned as a second output
+
+    """
+    
+    
+
+    ref_image=np.copy(ref_image_in)    
+    ref_mask =np.copy(ref_image_in)
+    ref_mask[:,:]=1
+    
+    NVN=0
+    # Set all the NaN and all the other values to be excluded to 0.
+    # In this way the autocorrelation function will simply ignore them
+    ref_image[np.isnan(ref_image)]=NVN
+    for i in range(np.size(exclude_val)):
+      if np.size(exclude_val)==1:
+        ref_image[ref_image==exclude_val]=NVN
+      if np.size(exclude_val)>1:
+        ref_image[ref_image==exclude_val[i]]=NVN
+    
+    ref_mask[ref_image==NVN]=0.
+    
+    if norm_blocks == "Global":
+        Global_ref_stdv=(np.percentile(ref_image[ref_image!=NVN],[84]) - np.percentile(ref_image[ref_image!=NVN],[16])) /2.
+        Global_ref_med=np.percentile(ref_image[ref_image!=NVN],[50])
+
+    # Create temporary working images
+    tmp_img=np.copy(ref_image)
+    tmp_img[:,:]=0.
+    tmp_img_shy=np.copy(tmp_img)
+    tmp_img_shx=np.copy(tmp_img)
+    tmp_img_shxy=np.copy(tmp_img)
+    map_weights_y=np.copy(tmp_img)
+    map_weights_x=np.copy(tmp_img)
+    x_strip=np.copy(tmp_img[0,:]) # o ne-dimensional weights (along x)
+    y_strip=np.copy(tmp_img[:,0]) # one-dimensional weights (along y)
+
+    # Get image dimensions
+    img_height, img_width = ref_image.shape[0:2]
+
+    # Number of sectors along each axis
+    N_SECT_axis = round(img_width/box_size)
+
+    # Actual size of the blocks in pixels
+    SECT_Npix_x = round(img_width / N_SECT_axis)
+    SECT_Npix_y = round(img_height / N_SECT_axis)
+    
+    # shifts along x and y
+    shift_x = round(0.5*img_width / N_SECT_axis)
+    shift_y = round(0.5*img_height / N_SECT_axis)
+    
+    # Define triangular function (0-to-1) for the 
+    # amplitude of the weights
+    amp=1.0
+    # period
+    per_x=SECT_Npix_x # Triangular Period along x 
+    per_y=SECT_Npix_y # Triangular Period along y 
+    indices_x = np.arange(len(x_strip))
+    indices_y = np.arange(len(y_strip))
+    x_strip=1.0 - np.abs((indices_x % per_x) - per_x/2)
+    x_strip=x_strip-np.min(x_strip)
+    x_strip=amp*x_strip/np.max(x_strip)
+    y_strip=1.0 - np.abs((indices_y % per_y) - per_y/2)
+    y_strip=y_strip-np.min(y_strip)
+    y_strip=amp*y_strip/np.max(y_strip)
+    
+    # Compute weighting maps
+    map_weights_x[:,:]=x_strip
+    # set x extremes to 1 (image borders must be kept into account)
+    map_weights_x[:,0:per_x//2]=amp # to keep the borders into account
+    map_weights_x[:,(img_width-1)-per_x//2 : img_width] = amp
+    
+    map_weights_y.T[:,:]=y_strip # WARNING: must be transposed (.T), to fill it with the 1D strip!
+    # set y extremes to 1 (image borders must be kept into account)
+    map_weights_y[0:per_y//2 , :]=amp # to keep the borders into account
+    map_weights_y[(img_height-1)-per_y//2 : img_height , :] = amp
+
+    if RETURN_AVERAGE_ACF==True:
+      #average_ACF=np.zeros((SECT_Npix_y,SECT_Npix_x))
+      average_ACF=np.zeros((SECT_Npix_y+2,SECT_Npix_x+2))
+      ww_tot=0
+
+
+    ###   #--------------------------------------------------
+    ###   # Size of the stamp used for local ACF convolution
+    ###   ACF_x_bot=round((box_size/2)-LACF_STAMP_SIZE/2)
+    ###   ACF_x_top=round((box_size/2)+LACF_STAMP_SIZE/2)
+    ###   ACF_y_bot=round((box_size/2)-LACF_STAMP_SIZE/2)
+    ###   ACF_y_top=round((box_size/2)+LACF_STAMP_SIZE/2)
+    ###   ACF_x_bot=max([ACF_x_bot,0])
+    ###   ACF_y_bot=max([ACF_y_bot,0])
+    ###   ## These two are set below (LOCAL_ACF shape still unknown)
+    ###   # ACF_x_top=min([ACF_x_top, np.size(LOCAL_ACF[0,:])])
+    ###   # ACF_y_top=min([ACF_y_top, np.size(LOCAL_ACF[:,0])])
+    ###    
+    ###   #--------------------------------------------------
+
+      
+    pix_start_y = 0
+    pix_stop_y = SECT_Npix_y
+    borrow_y=0
+    additive_pix_y=0
+    additive_pix_y_tot=0
+    cnt=0
+    
+    for i in range(N_SECT_axis):
+
+        pix_start_x = 0
+        pix_stop_x = SECT_Npix_x
+        borrow_x=0
+        additive_pix_x=0
+        additive_pix_x_tot=0
+        for j in range(N_SECT_axis):
+
+            LOCAL_ACF=ref_image[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x] # Initialize with the image itself
+            LOCAL_BIAS=ref_mask[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]
+            
+            N_valid_pix=np.size(LOCAL_ACF[LOCAL_ACF!=0]) # Keep this form. "N_valid_pix" is needed (and can't be computed) below.
+            if N_valid_pix>0:
+              # LOCAL_ACF=GET_LOCAL_ACF(image_block, mask_block, algorithm='FFTC')
+              LOCAL_ACF=GET_LOCAL_ACF(LOCAL_ACF,LOCAL_BIAS, algorithm=algorithm, shrink_factor=shrink_factor)
+              
+
+              
+              if RETURN_AVERAGE_ACF==True:
+                  #________________________________________________________________
+                  # Recompute Number of valid pixels as LOCAL_ACF is something different now...
+                  N_valid_pix2=np.size(LOCAL_ACF[LOCAL_ACF!=0]) # Keep this form. "N_valid_pix" is needed (and can't be computed) below.
+                  if N_valid_pix2>0:
+                      height_diff = average_ACF.shape[0] - LOCAL_ACF.shape[0]
+                      width_diff = average_ACF.shape[1] - LOCAL_ACF.shape[1]
+                      #height_diff = np.max([average_ACF.shape[0] - LOCAL_ACF.shape[0],0])
+                      #width_diff = np.max([average_ACF.shape[1] - LOCAL_ACF.shape[1],0])
+                      pad_top = pad_bottom = height_diff // 2
+                      pad_left = pad_right = width_diff // 2
+                      if (pad_top > 0 or pad_left > 0):
+                          padded_LOCAL_ACF = np.pad(LOCAL_ACF, [(pad_top, pad_bottom), (pad_left, pad_right)], mode='constant')
+                      else:
+                        padded_LOCAL_ACF = LOCAL_ACF  # No padding needed if sizes are the same
+ 
+                      # Weight depends on the fraction of valid pixels
+                      ww=N_valid_pix2/np.size(LOCAL_ACF) # constant
+                      ww_tot=ww_tot+ww
+                      #average_ACF[0:np.size(padded_LOCAL_ACF[:,0]), 0:np.size(padded_LOCAL_ACF[0,:])]=average_ACF[0:np.size(padded_LOCAL_ACF[:,0]), 0:np.size(padded_LOCAL_ACF[0,:])]+(padded_LOCAL_ACF/np.sum(padded_LOCAL_ACF))*ww
+                      # if np.size(padded_LOCAL_ACF[:,0])==29: stop() # Debug
+                      # if np.size(padded_LOCAL_ACF[0,:])==29: stop() # Debug
+                
+                      average_ACF[0:np.size(padded_LOCAL_ACF[:,0]), 0:np.size(padded_LOCAL_ACF[0,:])]=average_ACF[0:np.size(padded_LOCAL_ACF[:,0]), 0:np.size(padded_LOCAL_ACF[0,:])]+(padded_LOCAL_ACF/np.abs(np.sum(padded_LOCAL_ACF)))*ww
+                
+                      #if np.size(np.where(np.isnan(average_ACF)==True))>0: stop()
+                
+                      ###plt.imshow(LOCAL_ACF, cmap='gray')
+                      #plt.imshow(average_ACF, cmap='gray')
+                      #plt.gca().invert_yaxis()
+                      #plt.show()
+                      #print('yyyyyyyyyyyyyyyyy')
+                      #print(np.min(padded_LOCAL_ACF),np.max(padded_LOCAL_ACF))
+                      #print(ww_tot)
+                      #print(np.sum(padded_LOCAL_ACF))
+                      ##if np.sum(padded_LOCAL_ACF)<0: stop()
+                      #print('xxxxxxxxxxxxxxxxx')
+                      ##stop()
+                      #________________________________________________________________
+
+            
+            # Compute local ACF + shift y
+            if (pix_start_y+shift_y < img_height and pix_stop_y+shift_y <= img_height):
+              LOCAL_ACF_shy = ref_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x] # Initialize with the image itself
+              LOCAL_BIAS_shy = ref_mask[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]
+              if np.size(LOCAL_ACF_shy[LOCAL_ACF_shy!=0])>0:
+                LOCAL_ACF_shy=GET_LOCAL_ACF(LOCAL_ACF_shy,LOCAL_BIAS_shy, algorithm=algorithm, shrink_factor=shrink_factor)
+            
+            # Compute local ACF + shift x
+            if (pix_start_x+shift_x < img_width and pix_stop_x+shift_x <= img_width):
+              LOCAL_ACF_shx =ref_image[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x] # Initialize with the image itself
+              LOCAL_BIAS_shx =ref_mask[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]
+              if np.size(LOCAL_ACF_shx[LOCAL_ACF_shx!=0])>0:
+                LOCAL_ACF_shx=GET_LOCAL_ACF(LOCAL_ACF_shx,LOCAL_BIAS_shx, algorithm=algorithm, shrink_factor=shrink_factor)
+                
+            # Compute local ACF + shift x &  + shift y
+            if (pix_start_y+shift_y < img_height and pix_stop_y+shift_y <= img_height and pix_start_x+shift_x < img_width and pix_stop_x+shift_x <= img_width):
+              LOCAL_ACF_shxy = ref_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x] # Initialize with the image itself
+              LOCAL_BIAS_shxy = ref_mask[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]
+              if np.size(LOCAL_ACF_shxy[LOCAL_ACF_shxy!=0])>0:
+                LOCAL_ACF_shxy=GET_LOCAL_ACF(LOCAL_ACF_shxy,LOCAL_BIAS_shxy, algorithm=algorithm, shrink_factor=shrink_factor)
+
+            #if np.size(np.where(np.isnan(LOCAL_ACF)==True))>0: stop()
+            #if np.size(np.where(np.isnan(LOCAL_ACF_shy)==True))>0: stop()
+            #if np.size(np.where(np.isnan(LOCAL_ACF_shx)==True))>0: stop()
+            #if np.size(np.where(np.isnan(LOCAL_ACF_shxy)==True))>0: stop()
+                
+            if (SHOW_PLOT):
+                # Create a plot to visualize the ACF DEBUG PURPOSE ONLY!
+                plt.figure(figsize=(8, 8))
+                plt.imshow(
+                    LOCAL_ACF,
+                    cmap="viridis",
+                    origin="lower",
+                    extent=[
+                        -LOCAL_ACF.shape[1] // 2,
+                        LOCAL_ACF.shape[1] // 2,
+                        -LOCAL_ACF.shape[0] // 2,
+                        LOCAL_ACF.shape[0] // 2,
+                    ],
+                )
+                plt.colorbar(label="Local ACF")
+                plt.title("Local Noise Auto-Correlation Function (ACF)")
+                plt.xlabel("Offset (Pixels)")
+                plt.ylabel("Offset (Pixels)")
+                plt.show()
+
+
+            # Convolve img with local ACF (mode=same to obtain the same image size)
+            #----------------------------------------------------------------------
+            #
+            # SAME POSITION ############################################    
+            #ACF_x_top=min([ACF_x_top, np.size(LOCAL_ACF[0,:])])
+            #ACF_y_top=min([ACF_y_top, np.size(LOCAL_ACF[:,0])])
+
+            # Version 1.0.3
+#            tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x] = scipy.signal.convolve2d(
+#                input_image[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x],
+#                #LOCAL_ACF[ACF_x_bot:ACF_x_top,ACF_y_bot:ACF_y_top],
+#                LOCAL_ACF,
+#                mode="same",
+#                boundary='wrap'
+#            )
+
+            # Version 1.0.4
+            tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x] = random_stamp_from_acf(LOCAL_ACF,ref_image[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x].shape)
+
+            
+            # TEST TEST - END
+#            if box_size==256:
+#                tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x] = scipy.signal.convolve2d(
+#                    input_image[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x],
+#                    LOCAL_ACF[int(256/2 - 20) : int(256/2 + 20) , int(256/2 - 20) : int(256/2 + 20)],
+#                    mode="same",boundary='wrap'
+#                )
+
+            ###plt.imshow(LOCAL_ACF[int(256/2 - 25) : int(256/2 + 25) , int(256/2 - 25) : int(256/2 + 25)], cmap='gray')
+            #plt.imshow(LOCAL_ACF, cmap='gray')
+            #plt.gca().invert_yaxis()
+            #plt.show()
+            ## TEST TEST - END
+            
+            
+            # -- Normalization
+            if (norm_blocks!='No' and norm_blocks!=None):
+                block_img=tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]
+                ### Local_img_stdv=(np.percentile(block_img,[84]) - np.percentile(block_img,[16])) /2.
+                if np.size(np.unique(block_img[block_img!=NVN]))>=3:
+                    Local_img_stdv=(np.percentile(block_img[block_img!=NVN],[84]) - np.percentile(block_img[block_img!=NVN],[16])) /2.
+                else:
+                    Local_img_stdv=[0]
+                
+                if (norm_blocks=='Local' and Local_img_stdv[0]!=0):
+                    block_ref=ref_image[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]
+                    ### Local_ref_stdv=(np.percentile(block_ref,[84]) - np.percentile(block_ref,[16])) /2.
+                    if np.size(np.unique(block_ref[block_ref!=NVN]))>=3:
+                        Local_ref_stdv=(np.percentile(block_ref[block_ref!=NVN],[84]) - np.percentile(block_ref[block_ref!=NVN],[16])) /2.
+                        tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]=(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]/Local_img_stdv)*Local_ref_stdv
+                        # added
+                        ### tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]=(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x],[50]))+np.percentile(block_ref[block_ref!=NVN],[50])
+
+                        tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]=(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x][tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x] != NVN],[50]))+np.percentile(block_ref[block_ref!=NVN],[50])
+                        # added end
+                    else:
+                        Local_ref_stdv=[0]
+                    
+                if (norm_blocks=='Global' and Local_img_stdv[0]!=0):
+                    tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]=(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]/Local_img_stdv)*Global_ref_stdv
+                    # added
+                    ### tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]=(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x],[50]))+Global_ref_med
+                    tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]=(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x][tmp_img[pix_start_y:pix_stop_y, pix_start_x:pix_stop_x]!=NVN],[50]))+Global_ref_med
+                    # added end
+
+
+            # POSITION + shift y ############################################
+            if (pix_start_y+shift_y < img_height and pix_stop_y+shift_y <= img_height):
+                # Version 1.0.3
+#                tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x] = scipy.signal.convolve2d(
+#                    input_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x],
+#                    LOCAL_ACF_shy,
+#                    mode="same",
+#                    boundary='wrap'
+#                )
+                
+                # Version 1.0.4
+                tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x] = random_stamp_from_acf(LOCAL_ACF_shy,ref_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x].shape)
+                
+                # -- Normalization
+                if (norm_blocks!='No' and norm_blocks!=None):
+                    block_img_shy=tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]
+                    ### Local_img_stdv_shy=(np.percentile(block_img_shy,[84]) - np.percentile(block_img_shy,[16])) /2.
+                    if np.size(np.unique(block_img_shy[block_img_shy!=NVN]))>=3:
+                        Local_img_stdv_shy=(np.percentile(block_img_shy[block_img_shy!=NVN],[84]) - np.percentile(block_img_shy[block_img_shy!=NVN],[16])) /2.
+                    else:
+                        Local_img_stdv_shy=[0]
+                        
+                    if (norm_blocks=='Local' and Local_img_stdv_shy[0]!=0):
+                        block_ref_shy=ref_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]
+                        ### Local_ref_stdv_shy=(np.percentile(block_ref_shy[block_ref_shy!=NVN],[84]) - np.percentile(block_ref_shy[block_ref_shy!=NVN],[16])) /2.
+                        if np.size(np.unique(block_ref_shy[block_ref_shy!=NVN]))>=3:
+                            Local_ref_stdv_shy=(np.percentile(block_ref_shy[block_ref_shy!=NVN],[84]) - np.percentile(block_ref_shy[block_ref_shy!=NVN],[16])) /2.
+                            tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]=(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]/Local_img_stdv_shy)*Local_ref_stdv_shy
+                            # added
+                            ### tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]=(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x],[50]))+np.percentile(block_ref_shy,[50])
+                            tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]=(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x][tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]!=NVN],[50]))+np.percentile(block_ref_shy[block_ref_shy!=NVN],[50])
+                            # added end
+                        else:
+                            Local_ref_stdv_shy=[0]
+                        
+                    if (norm_blocks=='Global' and Local_img_stdv_shy[0]!=0):
+                      tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]=(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]/Local_img_stdv_shy)*Global_ref_stdv
+                      # added
+                      ### tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]=(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x],[50]))+Global_ref_med
+                      tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]=(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]-np.percentile(tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x][tmp_img_shy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x:pix_stop_x]!=NVN],[50]))+Global_ref_med
+                    # added end
+
+                        
+            # POSITION + shift x ############################################
+            if (pix_start_x+shift_x < img_width and pix_stop_x+shift_x <= img_width):
+                
+                # Version 1.0.3
+#                tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x] = scipy.signal.convolve2d(
+#                    input_image[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x],
+#                    LOCAL_ACF_shx,
+#                    mode="same",
+#                    boundary='wrap'
+#                )
+                    
+                # Version 1.0.4
+                tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x] = random_stamp_from_acf(LOCAL_ACF_shx,ref_image[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x].shape)
+                
+                # -- Normalization
+                if (norm_blocks!='No' and norm_blocks!=None):
+                    block_img_shx=tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]
+                    ### Local_img_stdv_shx=(np.percentile(block_img_shx,[84]) - np.percentile(block_img_shx,[16])) /2.
+                    if np.size(np.unique(block_img_shx[block_img_shx!=NVN]))>=3:
+                        Local_img_stdv_shx=(np.percentile(block_img_shx[block_img_shx!=NVN],[84]) - np.percentile(block_img_shx[block_img_shx!=NVN],[16])) /2.
+                    else:
+                        Local_img_stdv_shx=[0]
+                        
+                    if (norm_blocks=='Local' and Local_img_stdv_shx[0]!=0):
+                        block_ref_shx=ref_image[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]
+                        ### Local_ref_stdv_shx=(np.percentile(block_ref_shx,[84]) - np.percentile(block_ref_shx,[16])) /2.
+                        if np.size(np.unique(block_ref_shx[block_ref_shx!=NVN]))>=3:
+                            Local_ref_stdv_shx=(np.percentile(block_ref_shx[block_ref_shx!=NVN],[84]) - np.percentile(block_ref_shx[block_ref_shx!=NVN],[16])) /2.
+                            tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]/Local_img_stdv_shx)*Local_ref_stdv_shx
+                            # added
+                            ### tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x],[50]))+np.percentile(block_ref_shx,[50])
+                            tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x][tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]!=NVN],[50]))+np.percentile(block_ref_shx[block_ref_shx!=NVN],[50])
+                            # added end
+                        else:
+                            # tmp_img_shx=[0] # NO !
+                            Local_ref_stdv_shx=[0]
+                            
+                    if (norm_blocks=='Global' and Local_img_stdv_shx[0]!=0):
+                        tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]/Local_img_stdv_shx)*Global_ref_stdv
+                        # added
+                        ### tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x],[50]))+Global_ref_med
+                        tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x][tmp_img_shx[pix_start_y:pix_stop_y, pix_start_x+shift_x:pix_stop_x+shift_x]!=NVN],[50]))+Global_ref_med
+                        # added end
+
+            # POSITION + shift x + shift y ############################################
+            if (pix_start_y+shift_y < img_height and pix_stop_y+shift_y <= img_height and pix_start_x+shift_x < img_width and pix_stop_x+shift_x <= img_width):
+                # Version 1.0.3
+#                tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x] = scipy.signal.convolve2d(
+#                    input_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x],
+#                    LOCAL_ACF_shxy,
+#                    mode="same",
+#                    boundary='wrap'
+#                )
+                # Version 1.0.4
+                tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x] = random_stamp_from_acf(LOCAL_ACF_shxy,ref_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x].shape)
+                
+                # -- Normalization
+                if (norm_blocks!='No' and norm_blocks!=None):
+                    block_img_shxy=tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]
+                    ### Local_img_stdv_shxy=(np.percentile(block_img_shxy,[84]) - np.percentile(block_img_shxy,[16])) /2.
+                    if np.size(np.unique(block_img_shxy[block_img_shxy!=NVN]))>=3:
+                        Local_img_stdv_shxy=(np.percentile(block_img_shxy[block_img_shxy!=NVN],[84]) - np.percentile(block_img_shxy[block_img_shxy!=NVN],[16])) /2.
+                    else:
+                        Local_img_stdv_shxy=[0]
+                        
+                    if (norm_blocks=='Local' and Local_img_stdv_shxy[0]!=0):
+                        block_ref_shxy=ref_image[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]
+                        ### Local_ref_stdv_shxy=(np.percentile(block_ref_shxy,[84]) - np.percentile(block_ref_shxy,[16])) /2.
+                        if np.size(np.unique(block_ref_shxy[block_ref_shxy!=NVN]))>=3:
+                            Local_ref_stdv_shxy=(np.percentile(block_ref_shxy[block_ref_shxy!=NVN],[84]) - np.percentile(block_ref_shxy[block_ref_shxy!=NVN],[16])) /2.
+                            tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]/Local_img_stdv_shxy)*Local_ref_stdv_shxy
+                            # added
+                            ### tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x],[50]))+np.percentile(block_ref_shxy,[50])
+                            tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x][tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]!=NVN],[50]))+np.percentile(block_ref_shxy[block_ref_shxy!=NVN],[50])
+                            # added end
+                        else:
+                            Local_ref_stdv_shxy=[0]
+                            
+                    if (norm_blocks=='Global' and Local_img_stdv_shxy[0]!=0):
+                        tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]/Local_img_stdv_shxy)*Global_ref_stdv
+                        # added
+                        ### tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x],[50]))+Global_ref_med
+                        tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]=(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]-np.percentile(tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x][tmp_img_shxy[pix_start_y+shift_y:pix_stop_y+shift_y, pix_start_x+shift_x:pix_stop_x+shift_x]!=NVN],[50]))+Global_ref_med
+                        # added end
+
+
+
+            # When the approximate size of the boxes does not perfectly fit the image size...
+            # ...along x
+            borrow_x=(j+1)*(img_width/N_SECT_axis - round(img_width/N_SECT_axis)) - additive_pix_x_tot
+            additive_pix_x=round(borrow_x - int(borrow_x))
+            additive_pix_x_tot=additive_pix_x_tot+additive_pix_x
+            pix_start_x = pix_stop_x
+            pix_stop_x = pix_stop_x + SECT_Npix_x + additive_pix_x
+                
+        # When the approximate size of the boxes does not perfectly fit the image size...
+        # ...along y
+        borrow_y=(i+1)*(img_height/N_SECT_axis - round(img_height/N_SECT_axis)) - additive_pix_y_tot
+        additive_pix_y=round(borrow_y - int(borrow_y))
+        additive_pix_y_tot=additive_pix_y_tot+additive_pix_y
+        pix_start_y = pix_stop_y
+        pix_stop_y = pix_stop_y + SECT_Npix_y + additive_pix_y
+
+
+    # COMPUTE MERGED IMAGE  -----------------------------------------------
+    tmp_x=tmp_img*map_weights_x + tmp_img_shx*(amp-map_weights_x)
+    tmp_y=tmp_img*map_weights_y + tmp_img_shy*(amp-map_weights_y)
+    tmp_xy=tmp_img_shxy*(amp-map_weights_x)*(amp-map_weights_y)
+    output_image=tmp_x*map_weights_y + tmp_y*map_weights_x + tmp_xy*2
+
+    #output_image=map_weights_x
+
+    # FLAT FIELDING -------------------------------------------------------
+    # IMPORTANT NOTE: the same weights used above, for computing the merged 
+    #                 image, must be used using the same order
+
+    Flat_img_ref=np.copy(map_weights_x) 
+    Flat_img_ref[:]=1.
+    Flat_img=np.copy(Flat_img_ref)
+    Flat_img[tmp_img==0]=0.
+    Flat_img_shx=np.copy(Flat_img_ref)
+    Flat_img_shy=np.copy(Flat_img_ref)
+    Flat_img_shxy=np.copy(Flat_img_ref)
+    Flat_img_shx[tmp_img_shx==0]=0.
+    Flat_img_shy[tmp_img_shy==0]=0.
+    Flat_img_shxy[tmp_img_shxy==0]=0.
+
+    Flat_tmp_x=Flat_img*map_weights_x+Flat_img_shx*(amp-map_weights_x)
+    Flat_tmp_y=Flat_img*map_weights_y+Flat_img_shy*(amp-map_weights_y)
+    Flat_tmp_xy=Flat_img_shxy*(amp-map_weights_x)*(amp-map_weights_y)
+
+    Flat_main=Flat_tmp_x*map_weights_y+Flat_tmp_y*map_weights_x+Flat_tmp_xy*2
+ 
+    #output_image=output_image/Flat_main
+    output_image[output_image!=0]=output_image[output_image!=0]/Flat_main[output_image!=0]
+
+    if RETURN_AVERAGE_ACF==False:
+      return output_image#*0.5
+    if RETURN_AVERAGE_ACF==True:
+      average_ACF=average_ACF/ww_tot
+      average_ACF=average_ACF/np.sum(average_ACF)
+      return output_image, average_ACF
+
+
+
+  
 def create_elliptical_annular_mask(image_shape, center, b_inner, a_inner, b_outer, a_outer, angle):
 
     """ 
@@ -1087,11 +1822,11 @@ def create_elliptical_annular_mask(image_shape, center, b_inner, a_inner, b_oute
     angle: Rotation angle (in degrees) applied to the ellipses.
     """
 
-    print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
-    print('WARNING: THIS ANGLE MUST BE CHECKED')
-    print(' Function')
-    print('create_elliptical_annular_mask()')
-    print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+#    print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+#    print('WARNING: THIS ANGLE MUST BE CHECKED')
+#    print(' Function')
+#    print('create_elliptical_annular_mask()')
+#    print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
 
     angle=angle+90
 
@@ -1156,6 +1891,7 @@ def compute_elliptical_structure(in_image, sigma_thresh, stripes_width, stripes_
     x_coord, y_coord = np.meshgrid(np.linspace(0,width-1 , width), np.linspace(0, height-1, height))
     ###########################################
 
+    
     # Number of pixels to consider inside a corona:
     N_PIX_COR_W=stripes_width
     N_PIX_COR_L=stripes_length//2
@@ -1483,12 +2219,14 @@ def get_filter_name(FWHM_PIX):
     return filt_name
 
 
-def run_sex1(imagename_input,imagename_output,SEx_folder,filter_name,PIXEL_SCALE,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE,BACK_FILTERSIZE, img_type="BACKGROUND", DETECT_THRESH=1.5, ANALYSIS_THRESH=1.5, DETECT_MINAREA_BEAM=1.0):
+def run_sex1(imagename_input,imagename_output,SEx_folder,filter_name,PIXEL_SCALE,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE,BACK_FILTERSIZE, img_type="BACKGROUND", DETECT_THRESH=1.25, ANALYSIS_THRESH=1.25, DETECT_MINAREA_BEAM=1.0, keep_cat=False, cat_name='tmp_cat.fits'):
     #-------------------------------------------------------
-    # This function outputs an image (imagename_output) of 
-    # the large scale background of the input image
+    # This function outputs an image (imagename_output)
+    # and/or a catalog computed by SExtractor
     #-------------------------------------------------------
-
+    if img_type==None:
+        img_type="None"
+    
     # Internal parameters #########################
     BEAM_AREA=(1./(4.*np.log(2.))) * (np.pi*(FWHM_PIX_x)*(FWHM_PIX_y))
     FWHM_PIX=(FWHM_PIX_x+FWHM_PIX_y)/2.
@@ -1505,13 +2243,16 @@ def run_sex1(imagename_input,imagename_output,SEx_folder,filter_name,PIXEL_SCALE
     ###############################################
     # set "img_type" to select the type of sextractor "check image" desired
     # (BACKGROUND, BACKGROUND_RMS, -BACKGROUND, FILTERED, OBJECTS, -OBJECTS,
-    #  SEGMENTATION, or APERTURES
+    #  SEGMENTATION, APERTURES or NONE
     # create temporary folder to store temporary files
     tmp_folder='tmp_folder'
     os.system('mkdir '+tmp_folder)
+    # Catalog name
+    if keep_cat==False:
+        cat_name=tmp_folder+'/tmp_cat.fits'
+    
     # RUN SEXTRACTOR TO GET BACKGROUND
-    os.system('source-extractor '+imagename_input+' -c '+SEx_folder+'config_A.txt -CATALOG_NAME '+tmp_folder+'/tmp_cat.fits -PARAMETERS_NAME '+SEx_folder+'default.param -FILTER_NAME '+SEx_folder+filter_name+' -STARNNW_NAME '+SEx_folder+'default.nnw -DETECT_THRESH '+str(DETECT_THRESH)+' -ANALYSIS_THRESH '+str(ANALYSIS_THRESH)+' -DETECT_MINAREA '+str(round(DETECT_MINAREA))+' -SATUR_LEVEL 50000.0'+' -MAG_ZEROPOINT '+str(MAG_ZEROPOINT)+' -GAIN 0.0 -PIXEL_SCALE '+str(PIXEL_SCALE)+' -SEEING_FWHM '+str(FWHM_asec)+' -BACK_SIZE '+str(BACK_SIZE)+' -BACK_FILTERSIZE '+str(BACK_FILTERSIZE) +' -BACKPHOTO_TYPE LOCAL -WEIGHT_TYPE BACKGROUND -CHECKIMAGE_TYPE '+img_type+' -CHECKIMAGE_NAME '+imagename_output)
-
+    os.system('source-extractor '+imagename_input+' -c '+SEx_folder+'config_A.txt -CATALOG_NAME '+cat_name+' -PARAMETERS_NAME '+SEx_folder+'default.param -FILTER_NAME '+SEx_folder+filter_name+' -STARNNW_NAME '+SEx_folder+'default.nnw -DETECT_THRESH '+str(DETECT_THRESH)+' -ANALYSIS_THRESH '+str(ANALYSIS_THRESH)+' -DETECT_MINAREA '+str(round(DETECT_MINAREA))+' -SATUR_LEVEL 50000.0'+' -MAG_ZEROPOINT '+str(MAG_ZEROPOINT)+' -GAIN 0.0 -PIXEL_SCALE '+str(PIXEL_SCALE)+' -SEEING_FWHM '+str(FWHM_asec)+' -BACK_SIZE '+str(BACK_SIZE)+' -BACK_FILTERSIZE '+str(BACK_FILTERSIZE) +' -BACKPHOTO_TYPE LOCAL -WEIGHT_TYPE BACKGROUND -CHECKIMAGE_TYPE '+img_type+' -CHECKIMAGE_NAME '+imagename_output)
     # remove temporary folder and temporary files
     os.system('rm -r tmp_folder')
 
@@ -1893,7 +2634,6 @@ def get_gaussian_PSF(xsize,ysize,FWHM_PIX_a,FWHM_PIX_b,P_ANGLE):
     # between the PSF size and size of the pixel (along the major an minor axes).
     # The correction is negligible when FWHM[pixels]>>1
     # VARIABLE CORRECTION FACTOR
-    print("WARNING IVANO: THIS SHOULD BE CHECKED")
     corr_fact_a=1.0-1.0/ (abs(FWHM_PIX_a*math.sin(PA_rad)) + abs(FWHM_PIX_b*math.cos(PA_rad)))
     corr_fact_b=1.0-1.0/ (abs(FWHM_PIX_a*math.cos(PA_rad)) + abs(FWHM_PIX_b*math.sin(PA_rad)))
     # This one seems to work (but not always) MUST BE CHECKED TESTING DIFFERENT PA_ANGLES
@@ -1924,7 +2664,7 @@ def get_gaussian_PSF(xsize,ysize,FWHM_PIX_a,FWHM_PIX_b,P_ANGLE):
 
 
 
-def get_filtered_img(input_array_orig,SMALL_SCALE_THR,LARGE_SCALE_THR, show_imgs=False, save_spec_to_file=False, filename='magnitude_spectrum.fits'):
+def get_filtered_img(input_array_orig,SMALL_SCALE_THR,LARGE_SCALE_THR, show_imgs=False, save_spec_to_file=False, filename='magnitude_spectrum.fits',print_info=False):
     # Computes the Fast Fourier Transform (FFT) of an input image
     # (passed through an input array) and filters out the spatial 
     # frequencies above and below the thresholds specified by the
@@ -2015,13 +2755,13 @@ def get_filtered_img(input_array_orig,SMALL_SCALE_THR,LARGE_SCALE_THR, show_imgs
         plt.gca().invert_yaxis()
         #plt.set_title('Input image Spectrum')
         plt.show()
-    print('-------------------------------------------')
-
-    print('Magnitude spectrum minimum, median, maximum')
-    print(np.min(magnitude_spectrum))
-    print(np.median(magnitude_spectrum))
-    print(np.max(magnitude_spectrum))
-    print('-------------------------------------------')
+    if print_info==True:
+        print('-------------------------------------------')
+        print('Magnitude spectrum minimum, median, maximum')
+        print(np.min(magnitude_spectrum))
+        print(np.median(magnitude_spectrum))
+        print(np.max(magnitude_spectrum))
+        print('-------------------------------------------')
 
     ####################################################
     if save_spec_to_file==True:
@@ -2090,15 +2830,6 @@ def get_filtered_img(input_array_orig,SMALL_SCALE_THR,LARGE_SCALE_THR, show_imgs
 
     #-------------------------------------------------------------
 
-    print('-------------------------------------------')
-    print('Magnitude limits set')
-    print(low_magnitude_threshold)
-    print(high_magnitude_threshold)
-    print('Frequency limits set')
-    print(low_frequency_threshold)
-    print(high_frequency_threshold)
-    print('-------------------------------------------')
-
     # Create masks for frequencies and magnitudes that fall outside the thresholds
     # Frequencies and magnitudes that should NOT be considered
     frequency_mask = np.logical_or(distance < low_frequency_threshold, distance > high_frequency_threshold)
@@ -2150,22 +2881,241 @@ def get_hf_patterns(input_array, FWHM_PIX, show_imgs=False, save_spec_to_file=Fa
     return hf_patterns
 
 
-def fill_image_holes(image, hole_mask, patch_scale=2, n_pix_contour=2, ob_val=-99):
+def sharpen_local(img, alpha=1.0, sigma=1.0):
+    """
+    Sharpen grayscale image at small scales (1–2 pixels).
+    Parameters
+    ----------
+    img : np.ndarray
+        Grayscale image (uint8 or float32).
+    alpha : float
+        Sharpening strength. (0 = no change, higher = stronger sharpening).
+    sigma : float
+        Gaussian blur sigma (controls the scale of features enhanced).
+    
+    Returns
+    -------
+    enhanced : np.ndarray
+        Sharpened image, same dtype as input.
+    """
+    # Apply Gaussian blur to remove small detail
+    blur = cv2.GaussianBlur(img, (0,0), sigma)
 
+    # Unsharp mask: original + alpha * (original - blur)
+    enhanced = cv2.addWeighted(img, 1.0 + alpha, blur, -alpha, 0)
+
+    return enhanced
+
+def resize_to_shape(acf, out_shape, max_factor=(1,1)):
+    """
+    Resize an ACF patch to match out_shape by padding or cropping.
+
+    Parameters
+    ----------
+    acf : 2D ndarray
+        Input autocorrelation patch.
+    out_shape : (Ny, Nx)
+        Desired output shape.
+    max_factor : (fy, fx)
+        Maximum allowed enlargement factor (relative to out_shape).
+        If acf is larger than (fy*Ny, fx*Nx), it will be cropped.
+
+    Returns
+    -------
+    resized : 2D ndarray
+        Resized ACF patch, same dtype as input.
+    """
+    ny, nx = acf.shape
+    Ny, Nx = out_shape
+    fy, fx = max_factor
+
+    # allowed maximum sizes
+    max_ny, max_nx = int(fy*Ny), int(fx*Nx)
+
+    # crop if bigger than allowed
+    crop_y = min(ny, max_ny)
+    crop_x = min(nx, max_nx)
+
+    y0_in = (ny - crop_y)//2
+    x0_in = (nx - crop_x)//2
+    acf_cropped = acf[y0_in:y0_in+crop_y, x0_in:x0_in+crop_x]
+
+    # now pad/crop to exactly out_shape
+    resized = np.zeros(out_shape, dtype=acf.dtype)
+
+    sy = min(crop_y, Ny)
+    sx = min(crop_x, Nx)
+
+    y0_in = (crop_y - sy)//2
+    x0_in = (crop_x - sx)//2
+    y0_out = (Ny - sy)//2
+    x0_out = (Nx - sx)//2
+
+    resized[y0_out:y0_out+sy, x0_out:x0_out+sx] = \
+        acf_cropped[y0_in:y0_in+sy, x0_in:x0_in+sx]
+
+    return resized
+
+
+def random_stamp_from_acf(acf_patch, out_shape, rng=None, eps=1e-16):
+    """
+    Generate a random image with the same local autocorrelation as `acf_patch`.
+    The core idea is to manipulate the power spectral density (PSD) of the desired output image.
+    The PSD describes the distribution of power of a signal over its frequency components.
+    By controlling the PSD, we can indirectly control the autocorrelation of the resulting image.
+    The autocorrelation function (ACF) and the power spectral density (PSD) are mathematically linked through the Fourier Transform.
+    The acf_resized patch is shifted to be centered (ifftshift) and then the 2D Fast Fourier Transform (fft2) is applied.
+    This transforms the ACF from the spatial domain to the frequency domain, giving us the PSD.
+    Any negative values in the PSD (which can arise from numerical inaccuracies) are clipped to zero, as power cannot be negative.
+    A random image of the desired out_shape is generated using white noise. White noise has equal power across all frequencies,
+    meaning it's completely random and lacks any specific pattern.
+    
+    Parameters
+    ----------
+    acf_patch : 2D ndarray
+        The local autocorrelation patch (real, centered).
+    out_shape : tuple or None
+        Output image shape. If None, use acf_patch.shape.
+    rng : np.random.Generator or None
+        Random number generator. Default: np.random.default_rng().
+    eps : float
+        Small stabilizer to avoid sqrt of zero/negatives.
+
+    Returns
+    -------
+    out : 2D ndarray, float64
+        Random realization with target autocorrelation.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # --- Step 1: resize ACF to desired shape
+    acf_resized = resize_to_shape(acf_patch, out_shape, max_factor=(1,1))
+
+    # --- Step 2: get PSD from ACF
+    acf_centered = ifftshift(acf_resized)
+    PSD = np.real(fft2(acf_centered))
+    PSD[PSD < 0] = 0.0
+
+    # --- Step 3: sqrt(PSD) filter
+    amp = np.sqrt(PSD + eps)
+
+    # --- Step 4: white noise
+    white = rng.normal(size=out_shape)
+
+    # --- Step 5: filter in Fourier domain
+    W = fft2(white)
+    Y = W * amp
+    out = np.real(ifft2(Y))
+
+    # --- Step 6: normalize
+    out -= out.mean()
+    out /= (out.std() + 1e-12)
+    return out
+
+
+def deterministic_stamp_from_acf(acf_patch, out_shape, eps=1e-16):
+    """
+    Generate a 2D deterministic image with the same local autocorrelation as `acf_patch`.
+    Generate a random image with the same local autocorrelation as `acf_patch`.
+    The core idea is to manipulate the power spectral density (PSD) of the desired output image.
+    The PSD describes the distribution of power of a signal over its frequency components.
+    By controlling the PSD, we can indirectly control the autocorrelation of the resulting image.
+    The autocorrelation function (ACF) and the power spectral density (PSD) are mathematically linked through the Fourier Transform.
+    The acf_resized patch is shifted to be centered (ifftshift) and then the 2D Fast Fourier Transform (fft2) is applied.
+    This transforms the ACF from the spatial domain to the frequency domain, giving us the PSD.
+    Any negative values in the PSD (which can arise from numerical inaccuracies) are clipped to zero, as power cannot be negative.
+    It uses a fixed (zero) phase in the frequency domain (instead of a white noise image) to produce a deterministic realization
+    that preserves the spatial correlation.
+
+    Parameters
+    ----------
+    acf_patch : 2D ndarray
+        Input autocorrelation patch (real, centered). Determines the spatial correlation.
+    out_shape : tuple, optional
+        Desired output image shape. If None, defaults to `acf_patch.shape`.
+    eps : float
+        Small stabilizer to avoid sqrt of zero or negative PSD values.
+
+    Returns
+    -------
+    out : 2D ndarray, float64
+        Deterministic realization with the same autocorrelation as `acf_patch`.
+        The output is zero-mean and unit-variance.
+    
+    Notes
+    -----
+    - The autocorrelation is preserved exactly, but since we do not use
+      any random phase, the realization is deterministic.
+    - This can be used when you want to preserve small-scale patterns
+      from the autocorrelation without adding random scatter.
+    """
+    
+    # Resize ACF to output shape
+    acf_resized = resize_to_shape(acf_patch, out_shape, max_factor=(1,1))
+    
+    # Center
+    acf_centered = ifftshift(acf_resized)
+    
+    # PSD
+    PSD = np.real(fft2(acf_centered))
+    PSD[PSD < 0] = 0.0
+    
+    # sqrt(PSD) filter
+    amp = np.sqrt(PSD + eps)
+    
+    # Use zero-phase (or constant-phase) instead of random
+    phase = np.zeros_like(amp, dtype=np.complex128)
+    Y = amp * np.exp(1j*phase)
+    
+    out = np.real(ifft2(Y))
+    
+    # Normalize
+    out -= out.mean()
+    out /= (out.std() + 1e-12)
+    
+    return out
+
+
+def fill_image_holes(image, hole_mask, patch_scale=2, n_pix_contour=2, ob_val=-99, show_imgs=False, method=2, ACF_TYPE='GLOBAL', smooth_patch=False, smooth_scale=3):
+
+    
     # Fills the "holes" in an input image (numpy array) with patches copied 
-    # from the neighbooring areas. The area with the highest likelihood is
+    # from the neighbooring areas (method 1) or simulated by computing the ACF (method 2).
+    #   method 1: The area with the highest likelihood is
     # selected. The likelihood is computed using the difference between the 
     # non-masked pixels in the pacth and the pixels in the original image.
+    # Note: keyword ACF_TYPE does not influence the process using method 1
+    #   method 2: the auto correlation function is computed from the neighboring pixels.
+    # A random distribution of pixels is convolved with the Autocorrelation function (ACF)
+    # to create the pacth. The ACF can be global or local
+    #
+    # ADVICE:
+    # --> REPLACING backgound excesses in a background map:
+    #     Use method 1 or method 2 with ACF_TYPE='GLOBAL'
+    # --> REPLACING sources in the map (especially when dealing with crowded fields)
+    #     Use method 2 with ACF_TYPE='LOCAL'
+    #
+    # smooth_patch=False Set to True if the patch needs to be smoothed a little bit
+    #  in order to cut out small scale spurious noise introduced by the FFT computed
+    #  over finite areas. Advice: use it only when using this function over the background
+    #  (that is already smoothed). Not on the actual image, as it can originally have small scale
+    #  patterns that would be erased.
+    # smooth_scale=3 The smoothing scale applied in case smooth_patch=True
+    # 
     # The function creates a transition effect between the original image and the 
-    # patch, so that the borders of the patch (or the borders of the "holes")
+    # computed patch, so that the borders of the patch (or the borders of the "holes")
     # are not visible at the end of the process.
     # The "holes" are identified by a boolean mask provided by the user (hole_mask)
     # pixels set to 1 in the hole_mask will be replaced with a patch.
     # The size of the patch is set using "patch_scale". By default, the size is 
     # set to twice the size of the "holes".
     # Using "n_pix_contour", a certain number of additional pixels can be considered
-    # around each hole identified by the mask. This corresponds to increase the area 
-    # of the regions (holes) initially masked.
+    # around each hole identified by the mask. This corresponds to increasing the area 
+    # of the regions (holes) initially masked. This parameter must be larger that 0.
+    # NOTE: the number of pixels cut out outher than the original hole border is
+    # 2 x n_pix_contour. The borders of the patch will be smoothed out depending on
+    # this parameter. A smoothing scale equal to n_pix_contour/2. will be used.
     # The ob_val parameter (default=-99) indicates the values of the pixels outside
     # the borders of the scientific image (or other problematic pixels).
     # Patches should not be taken from this area.
@@ -2174,7 +3124,18 @@ def fill_image_holes(image, hole_mask, patch_scale=2, n_pix_contour=2, ob_val=-9
     # be masked (pixels set to 0 in the output image).
     # Requires:
     # import cv2
+    # import scipy
     # from scipy.ndimage import binary_dilation # expand a boolean mask of a few pixels
+    # PLUS, the local functions:
+    # sim_pix_distrib()
+    # normalize_distribution2()
+ 
+    
+    if (method==2 and ACF_TYPE=='GLOBAL'):
+        GLOBAL_ACF= scipy.signal.fftconvolve(image, np.flip(image), mode='same')
+    
+    if n_pix_contour<1:
+        n_pix_contour=1
 
     hole_mask=hole_mask.astype(bool)
 
@@ -2186,8 +3147,21 @@ def fill_image_holes(image, hole_mask, patch_scale=2, n_pix_contour=2, ob_val=-9
     #n_pix_contour = 2
     # Perform binary dilation on the mask
     if n_pix_contour>0:
+        shrinked_mask = np.copy(hole_mask) ## V1.0.4 Copy original mask into a copy (shrinked version) - used for final renormalization
         dilated_mask = binary_dilation(hole_mask, iterations=n_pix_contour)
+        
+        ## V1.0.4 Dilated version used for final renormalization
+        extended_mask = binary_dilation(hole_mask, iterations=n_pix_contour+n_pix_contour)
+        # Outer corona: the ring between dilated_mask and extended_mask ## V1.0.4 
+        outer_corona_mask = np.logical_and(extended_mask, np.logical_not(dilated_mask))
+        
         hole_mask=np.copy(dilated_mask)
+    #----------------------------------------------------------
+    ## V1.0.4
+    # Create images with inner and outer coronas concentric to the holes in the image
+    image_corona_masks=np.copy(image)
+    image_corona_masks[:]=0
+    image_corona_masks[outer_corona_mask==1]=+1
     #----------------------------------------------------------
     # set masked part of the image to 0
     image[hole_mask==1]=0.
@@ -2198,11 +3172,35 @@ def fill_image_holes(image, hole_mask, patch_scale=2, n_pix_contour=2, ob_val=-9
     # Find connected components in the hole mask
     _, labels = cv2.connectedComponents(hole_mask.astype(np.uint8))
 
+    #########################################################
+    # Sort labels from the largest holes to the smallest ones - V1.0.4
+    # 2. Count pixels for each label
+    num_pixels = np.bincount(labels.ravel())
+    # 3. Exclude background (label 0) and sort remaining by pixel count (descending)
+    # descending order (larger holes first)
+    #sorted_labels = np.argsort(-num_pixels[1:]) + 1  # +1 to account for label offset
+    # ascending order (smaller holes first)
+    sorted_labels = np.argsort(num_pixels[1:]) + 1  # ascending
+    # 4. Build remapping array: old_label -> new_label
+    remap = np.zeros(np.max(labels) + 1, dtype=np.int32)
+    remap[0] = 0  # Keep background as 0
+    remap[sorted_labels] = np.arange(1, len(sorted_labels) + 1)
+    # 5. Apply remapping in a vectorized way
+    reordered_labels = remap[labels]
+    # 6. Set labels to the reordered version
+    labels =reordered_labels
+    #########################################################
+
+
     # Iterate over each connected component (hole)
+    # From the smallest hole to the largest one
     for hole_label in range(1, np.max(labels) + 1):
+    # From the largest one to the smallest one
+    #for hole_label in range(np.max(labels), 0, -1):
         # Find pixels belonging to the current hole
         hole_pixels = np.where(labels == hole_label)
-                
+        hole_OUT_pixels = np.where(labels != hole_label) # complementary index
+        
         # Calculate hole center and bounding box coordinates
         y_center = int(np.mean(hole_pixels[0]))
         x_center = int(np.mean(hole_pixels[1]))
@@ -2226,169 +3224,325 @@ def fill_image_holes(image, hole_mask, patch_scale=2, n_pix_contour=2, ob_val=-9
                 
         # Initialize patch
         BCK_IMAGE_STAMP=np.copy(image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x])
-        MASK=np.copy(hole_mask[patch_min_y:patch_max_y, patch_min_x:patch_max_x].astype(bool))
-        PATCH=np.copy(BCK_IMAGE_STAMP)          
+        
+        # MASK=np.copy(hole_mask[patch_min_y:patch_max_y, patch_min_x:patch_max_x].astype(bool))
+        
+        # Only include pixels belonging to the current hole label
+        local_labels = labels[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
+        MASK = (local_labels == hole_label)
+
+        # Patch
+        PATCH=np.copy(BCK_IMAGE_STAMP)
+        
         update_patch=0
 
-        # Initialize reference RMS
-        ref_RMS=10.*np.sum(image**2)
-        # Define stamp to be replaced
+        # Define the stamp to be replaced
         stamp_image=image[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
-        # Pixels out of the scientific image border (patches taken out of border should not be used) 
-        ref_OOB=np.size(stamp_image[stamp_image==ob_val])
-        CONVERGE=False
-        while CONVERGE==False:
-          for i in range(3):
-            for j in range(3):
-                ########################################################################################
-                # Tweakreging around the i,j position
-                for i_tweak in range(10):
-                    for j_tweak in range(10):
-                        patch_corr_min_y=(i_tweak-5)+patch_min_y+(i-1)*min(patch_height,(patch_max_y-patch_min_y))
-                        patch_corr_max_y=(i_tweak-5)+patch_corr_min_y+min(patch_height,(patch_max_y-patch_min_y))
-                        patch_corr_min_x=(j_tweak-5)+patch_min_x+(j-1)*min(patch_width,(patch_max_x-patch_min_x))
-                        patch_corr_max_x=(j_tweak-5)+patch_corr_min_x+min(patch_width,(patch_max_x-patch_min_x))
-                        
-                        size_corr_x=patch_corr_max_x-patch_corr_min_x
-                        size_corr_y=patch_corr_max_y-patch_corr_min_y
-                                
-                        if patch_corr_min_y >= 0 and patch_corr_max_y<image.shape[0] and patch_corr_min_x >= 0 and patch_corr_max_x<image.shape[1] and size_x==size_corr_x and size_y==size_corr_y and not( abs(patch_corr_min_y-patch_min_y) < size_corr_y  and abs(patch_corr_min_x-patch_min_x) < size_corr_x  ) :
+        #stamp_image=image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x] # This consider the patches already placed
 
-                          # REPLACEMENT ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-                          #stamp_image=image[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
-                          stamp_patch=image[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x]
-                          OOB=np.size(stamp_patch[stamp_patch==ob_val])
-                          # Find suitable elements
-                          OK_elem_mask=np.where((stamp_image!=0) & (stamp_image!=ob_val) & (stamp_patch>0) & (stamp_patch!=ob_val), True, False)
-
-                          # number of suitable elements
-                          N_ok=float(np.size(OK_elem_mask[OK_elem_mask==True]))
-                          if N_ok>0:
-                            # If there is one suitable element at least, compute RMS
-                            diff=stamp_image[OK_elem_mask]-stamp_patch[OK_elem_mask]
-                            RMS=np.sqrt(np.sum(diff**2)/(1.0+np.size(diff)))
-                            
-                            DOIT=False
-                            if OOB<ref_OOB:
-                              DOIT=True
-                            if (OOB<=ref_OOB and (RMS<ref_RMS and RMS!=0)):
-                              DOIT=True
-                            if DOIT==True:
-                            #if (RMS<ref_RMS and RMS!=0 and OOB<=ref_OOB):
-                              update_patch=1
-                              ref_RMS=RMS
-                              ref_OOB=OOB
-                              #BCK_IMAGE_STAMP=image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
-                              PATCH=np.copy(image_out[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x])
-                              CONVERGE=True # One possible patch solution found for this hole
-                              # Set possible remaining non valid pixels to 0.
-                              #PATCH[PATCH==ob_val]=0
-                          # REPLACEMENT END ::::::::::::::::::::::::::::::::::::::::::::::::::::::
-                            
-
-                          # OLDER VERSION ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+        # Run always or only when method=1? If run, the replacement PATCH is simulated using a box that is close to the one that must be filled. On the one hand, the acf is computed over a cleaner area, with less zero values in it. However, the ACF is not precisely the one expected in the area that we want to fill, but something similar, as it will be computed using a stamp that is close to the hole but not not the stamp containing the hole itself:
+        alwaysrun=False # True
+        if ((method==1) or (alwaysrun==True)):
+           
+          # Initialize reference RMS
+          ref_RMS=10.*np.sum(image**2)
+          # Pixels out of the scientific image border (patches taken out of border should not be used) 
+          ref_OOB=np.size(stamp_image[stamp_image==ob_val])
+          
+          # pixles with null values in the original image but not in this hole
+          # (these pixels must be preserved at the end of the process
+          null_pix_img=np.where((labels[patch_min_y:patch_max_y, patch_min_x:patch_max_x]!=hole_label) & (stamp_image==0.))
+          
+          CONVERGE=False
+          while CONVERGE==False:
+            for i in range(3):
+              for j in range(3):
+                  ########################################################################################
+                  # Tweakreging around the i,j position
+                  for i_tweak in range(10):
+                      for j_tweak in range(10):
+                          patch_corr_min_y=(i_tweak-5)+patch_min_y+(i-1)*min(patch_height,(patch_max_y-patch_min_y))
+                          patch_corr_max_y=(i_tweak-5)+patch_corr_min_y+min(patch_height,(patch_max_y-patch_min_y))
+                          patch_corr_min_x=(j_tweak-5)+patch_min_x+(j-1)*min(patch_width,(patch_max_x-patch_min_x))
+                          patch_corr_max_x=(j_tweak-5)+patch_corr_min_x+min(patch_width,(patch_max_x-patch_min_x))
                           
-                          ###diff=image[patch_min_y:patch_max_y, patch_min_x:patch_max_x]-image[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x]
-                          ###mask_diff=hole_mask[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
-                          ####RMS=np.sqrt(np.sum(diff**2)/np.size(diff))
-                          ###RMS=np.sqrt(np.sum(diff[mask_diff==0]**2)/(1.0+np.size(diff[mask_diff==0])))
-                          #### Number of pixels out of the scientific image borders
-                          ###OOB=np.size(np.where(image[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x]==ob_val))
-                          ###
-                          ###if (RMS<ref_RMS and RMS!=0 and OOB<=ref_OOB):
-                          ####if OOB<=ref_OOB:
-                          ###  update_patch=1
-                          ###  ref_RMS=RMS
-                          ###  ref_OOB=OOB
-                          ###  #BCK_IMAGE_STAMP=image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
-                          ###  PATCH=np.copy(image_out[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x])
-                          ###  #MASK=hole_mask[patch_min_y:patch_max_y, patch_min_x:patch_max_x].astype(bool)
+                          size_corr_x=patch_corr_max_x-patch_corr_min_x
+                          size_corr_y=patch_corr_max_y-patch_corr_min_y
+                                  
+                          if patch_corr_min_y >= 0 and patch_corr_max_y<image.shape[0] and patch_corr_min_x >= 0 and patch_corr_max_x<image.shape[1] and size_x==size_corr_x and size_y==size_corr_y and not( abs(patch_corr_min_y-patch_min_y) < size_corr_y  and abs(patch_corr_min_x-patch_min_x) < size_corr_x  ) :
+  
+                            # REPLACEMENT ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+                            stamp_patch=image[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x]
+                            #stamp_patch=image_out[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x]
+                            #stamp_image_out=image_out[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x]
+                            OOB=np.size(stamp_patch[stamp_patch==ob_val])
+                            # Find suitable elements
+                            OK_elem_mask=np.where((stamp_image!=0) & (stamp_image!=ob_val) & (stamp_patch>0) & (stamp_patch!=ob_val), True, False)
+  
+                            # number of suitable elements
+                            N_ok=float(np.size(OK_elem_mask[OK_elem_mask==True]))
+                            # V 1.0.3
+                            #if N_ok>0:
+                            # V 1.0.4
+                            # if (N_ok>0 and np.size(stamp_patch[stamp_patch==0])<np.size(stamp_image[stamp_image==0])):
+                            if (N_ok>0 and np.size(stamp_patch[stamp_patch==0])<np.size(stamp_image[stamp_image==0])):
+                              # If there is one suitable element at least, compute RMS
+                              diff=stamp_image[OK_elem_mask]-stamp_patch[OK_elem_mask]
+                              RMS=np.sqrt(np.sum(diff**2)/(1.0+np.size(diff)))
+                              
+                              DOIT=False
+                              if OOB<ref_OOB:
+                                DOIT=True
+                              if (OOB<=ref_OOB and (RMS<ref_RMS and RMS!=0)):
+                                DOIT=True
+                              if DOIT==True:
+                              #if (RMS<ref_RMS and RMS!=0 and OOB<=ref_OOB):
+                                update_patch=1
+                                ref_RMS=RMS
+                                ref_OOB=OOB
+                                #BCK_IMAGE_STAMP=image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x]
+                                PATCH=np.copy(image_out[patch_corr_min_y:patch_corr_max_y, patch_corr_min_x:patch_corr_max_x])
+                                CONVERGE=True # One possible patch solution found for this hole
+                                # Set possible remaining non valid pixels to 0.
+                                #PATCH[PATCH==ob_val]=0
+                            # REPLACEMENT END ::::::::::::::::::::::::::::::::::::::::::::::::::::::
+  
+            # Sometimes the procedure doesn't converge. This is
+            #  because RMS doesn't decrease or because OOB increases
+            # (some bad pixels are included in the patch). In this case,
+            # the solution with bad pixels included must be taken into account
+            # Bad pixels will be repaced by zeros.
+            if ref_OOB>np.size(stamp_image):
+              CONVERGE=True
+            if CONVERGE==False:
+              ref_OOB=ref_OOB+max(1,ref_OOB*0.1)
 
-          # Sometimes the procedure doesn't converge. This is
-          #  because RMS doesn't decrease or because OOB increases
-          # (some bad pixels are included in the patch). In this case,
-          # the solution with bad pixels included must be taken into account
-          # Bad pixels will be repaced by zeros.
-          if ref_OOB>np.size(stamp_image):
-            CONVERGE=True
-          if CONVERGE==False:
-            ref_OOB=ref_OOB+max(1,ref_OOB*0.1)
+          #stop()
+        ###########################################################
+        ###########################################################
+        # Version 1.0.4 - Added method 2 (ACF)
+        if method==2:
             
-          ########################################################################################
+          # Create a random pixel distribution with same distribution as the non-zero pixels in the stamp
+          #perc_min=2.5 # minimum percentile considered
+          #perc_max=97.5 # maximum percentile considered
+          #patch_1pix_random,sigma_Gx=sim_pix_distrib(stamp_image,perc_min,perc_max,SHOW_PLOT=False,sim_img='replicate',exclude_val=[0,ob_val])
+
+          
+          # Get the ACF (only non-zero values are considered!) and convolve it with the random pixel image, to obtain a random stamp with similar pixel distribution
+        
+          # LOCAL ACF 
+          if ACF_TYPE=='LOCAL':
+
+            # Compute local ACF
+            # Note: it may not be sensible to the largest scales! Not suited for replacing large holes in background images (wide ACF)
+            #ACF_patch = scipy.signal.fftconvolve(PATCH, np.flip(PATCH), mode='same')
+            ACF_patch = scipy.signal.convolve2d(PATCH, np.flip(PATCH),mode='same',boundary='wrap')
+
+#            # Bias correction (for finite sampling areas)
+#            PATCH_sized_1=np.copy(PATCH)
+#            PATCH_sized_1[PATCH!=0]=1 #---
+#
+#            # Remove patterns due to the small sampling area
+#            ACF_patch_correction = scipy.signal.convolve2d(PATCH_sized_1, np.flip(PATCH_sized_1),mode='same',boundary='wrap')            
+#            # ACF correction normalization
+#            ACF_patch_correction = (ACF_patch_correction/np.max(ACF_patch_correction))*np.sum(ACF_patch)
+#            ACF_patch = ACF_patch - ACF_patch_correction
+
+            # Clip negative values
+            #ACF_patch[ACF_patch < 0] = 0.0
+
+          # GLOBAL ACF 
+          if ACF_TYPE=='GLOBAL':
+            ACF_min_y = image.shape[0]//2 - patch_height // 2
+            ACF_max_y = image.shape[0]//2 + patch_height // 2
+            ACF_min_x = image.shape[1]//2 - patch_width // 2
+            ACF_max_x = image.shape[1]//2 + patch_width // 2
+#            ACF_patch = np.copy(GLOBAL_ACF[ACF_min_y:ACF_max_y,ACF_min_x:ACF_max_x])
+            ACF_patch = np.copy(GLOBAL_ACF)
+
+            
+          # Obtain a random image with a PSF (ACF) similar to that measured in the PATCH to be replaced
+          #RANDOM_stamp_image=scipy.signal.convolve2d(patch_1pix_random,ACF_patch,mode='same',boundary='wrap') # ok
+          # The following one should be the proper way to obtain the result, but it doesn't work properly (it adds too contrast at the smallest scales (1-2 pixels), probably due to the impossibility to obtain an ACF over an infinite sampling area.
+          #RANDOM_stamp_image = random_stamp_from_acf(ACF_patch, out_shape=stamp_image.shape)
+          RANDOM_stamp_image = deterministic_stamp_from_acf(ACF_patch, out_shape=stamp_image.shape)
+
+
+          
+          # TEST
+          # TEST
+          # TEST
+#
+#            eps=1e-16
+#            Ny, Nx = PATCH.shape
+#            F = np.fft.fft2(PATCH)
+#            PSD = np.abs(F)**2 / (Nx*Ny)   # optionally normalize by N
+#            sqrtPSD = np.sqrt(PSD + eps)
+#            white = patch_1pix_random#rng.normal(size=(Ny, Nx))
+#            W = np.fft.fft2(white)
+#            Y = W * sqrtPSD
+#            y = np.real(np.fft.ifft2(Y))
+#            y = y - np.mean(y)
+#            # scale y to have same std as img0
+#            RANDOM_stamp_image = y * (np.std(PATCH) / (np.std(y) + 1e-30))
+            
+          # TEST
+          # TEST
+          # TEST
+        
+          
+          #-------------------------------
+          # SHARPENING - ONLY FOR METHOD 2
+          #-------------------------------
+          # Need to increase the contrast of the output patch at very small scales,
+          #  if the output patch is obtained by convolving the random pixels image
+          #  with a PSF (an ACF, in this case).
+          # The convolution would not preserve the small scale (pixel-scale) variation
+          # as the smallest scale for the random pixel patch is the pixel size. 
+          #PATCH=sharpen_local(PATCH, alpha=1.0, sigma=1.0)
+          #PATCH=sharpen_local(PATCH, alpha=5.0, sigma=1.0)
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=2.0, sigma=2.0)
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=3.0, sigma=3.0)
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=5.0, sigma=3.0)
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=5.0, sigma=3.0)
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=5.0, sigma=2.0) # Sembra ok con SHA
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=5.0, sigma=1.0) # no
+#          RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=10.0, sigma=1.0) # ok
+#           RANDOM_stamp_image=sharpen_local(RANDOM_stamp_image, alpha=20.0, sigma=0.5) # meglio con sigma 1...
+          #-------------------------------
+          if smooth_patch==True:
+              RANDOM_stamp_image = gaussian_filter(RANDOM_stamp_image, sigma=smooth_scale)
+
+              
+          # Define the PATCH to apply AND Normalize to the original distribution.
+          PATCH=normalize_distribution2(RANDOM_stamp_image,stamp_image, perc1=16, perc2=84, recenter='Peak', precision=200, exclude_val=[0,ob_val], sample='logistic', stepness=0.5)
+
+          
+
+          if 1==0:
+#          if 1==1:
+            #---------------------
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15,5))
+            ax1.imshow(image[patch_min_y:patch_max_y, patch_min_x:patch_max_x], cmap='gray')
+            ax2.imshow(ACF_patch, cmap='gray')
+            ax3.imshow(PATCH, cmap='gray')
+            ax3.imshow(PATCH, cmap='gray')
+            plt.show()
+#            stop()
+          ###########################################################
+          ###########################################################
+                          
+
+            
+        ########################################################################################
 
         # Set remaining non valid pixels in the patch (when ref_OOB is still>0) to 0.
         PATCH[PATCH==ob_val]=0
-#        if np.size(np.where(PATCH<-20))>0:
-#          print(x_center,y_center)
-#          stop()
 
-        ## Create Transition between image and patch
-                                
-        # Calculate the blending weights
-        weights_patch = np.zeros_like(PATCH)
-        weights_image = np.zeros_like(PATCH)
-                            
-        # Calculate the distance from the center of PATCH
-        center_y = PATCH.shape[0] // 2
-        center_x = PATCH.shape[1] // 2
-        distance_y = np.abs(np.arange(PATCH.shape[0]) - center_y)
-        distance_x = np.abs(np.arange(PATCH.shape[1]) - center_x)
+        ########################################################################################
 
-        # Calculate the transition factor based on the distance and MASK
-        transition_factor_y = distance_y / (PATCH.shape[0] - 1)
-        transition_factor_x = distance_x / (PATCH.shape[1] - 1)
-
-        # Resize transition_factor_y to match the shape of PATCH
-        transition_factor_y = np.expand_dims(transition_factor_y, axis=1)
-        transition_factor_y = np.tile(transition_factor_y, (1, PATCH.shape[1]))
-
-        # Resize transition_factor_x to match the shape of PATCH
-        transition_factor_x = np.expand_dims(transition_factor_x, axis=0)
-        transition_factor_x = np.tile(transition_factor_x, (PATCH.shape[0], 1))
-
-        # Calculate the transition factor by taking the minimum
-        #transition_factor = np.minimum(transition_factor_y, transition_factor_x)
-        transition_factor = np.maximum(transition_factor_y, transition_factor_x)
-        #------------------------------------------------------------
-        transition_factor =transition_factor -np.min(transition_factor)
-        transition_factor =transition_factor/np.max(transition_factor)
-        #------------------------------------------------------------
-        transition_factor = np.clip(transition_factor, 0, 1)
-
-        # noise is attenuated sqrt(2) when the average (weight=0.5) of two
-        # uncorrelated images is considered. The following correction factor
-        # keeps into account for this effect.
-        correction_factor=1.0+(np.sqrt(2)-1)*(2.0*(0.5-abs(transition_factor-0.5)))
-                
-        weights_image = transition_factor #* MASK
-        weights_patch = (1 - transition_factor) #* MASK
+        # pixles with null values in the patch
+        null_pix_patch=np.where(PATCH==0.)
         
-        # Perform the weighted blending
-        PATCHED_IMAGE_STAMP = PATCH * weights_patch + BCK_IMAGE_STAMP * weights_image
+#        #..........................................................................
+#        # --- Match intensity and stdv between PATCH and surrounding background ---
+#        patch_vals = PATCH[MASK] # Patch values to consider (only inside the hole)
+#        patch_mean = np.mean(patch_vals[(patch_vals!=0) & (patch_vals!=ob_val)])
+#        # Corona values to consider
+#        image_vals = image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x][image_corona_masks[patch_min_y:patch_max_y, patch_min_x:patch_max_x] == +1]
+#        image_vals = image_vals[(image_vals!=0)&(image_vals!=ob_val)]
+#        med_out_c=np.mean(image_vals)
+#        PATCH = (PATCH - patch_mean) + med_out_c
+#        # reset null values  originally in the patch
+#        PATCH[null_pix_patch]=0
+#        #...........................................................................
 
-        #--------------------------------------------------------------------------------
-        # SET masked values to value of the patch (no transition effect, in this case)
-        PATCHED_IMAGE_STAMP[MASK==1]=PATCH[MASK==1]
-        correction_factor[MASK==1]=1.0
-        #--------------------------------------------------------------------------------
+    
+        # --- Step 1: Place patch ---
+        PATCHED_IMAGE_STAMP = np.copy(BCK_IMAGE_STAMP)
+        PATCHED_IMAGE_STAMP[MASK] = PATCH[MASK]
 
-        # Perform the weighted blending
-        image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x] = PATCHED_IMAGE_STAMP*correction_factor
+        # --- Step 2: Define blending width ---
+        # Distance from hole's bounding box to patch edges
+        top_margin = min_y - patch_min_y
+        bottom_margin = patch_max_y - max_y
+        left_margin = min_x - patch_min_x
+        right_margin = patch_max_x - max_x
+
+        # This defines how many pixels outside the hole we want to blend over
+        # Compute the minimum distance to any edge of the patch
+        blend_width = int(min(top_margin, bottom_margin, left_margin, right_margin)) - 1
+        #blend_width = int(max(top_margin, bottom_margin, left_margin, right_margin)) - 1
+        # Ensure blend_width is at least 1 to allow any blending
+        #blend_width = max(blend_width, 1)
+        # Ensure blend_width is at least 5 pixels to allow any blending
+        blend_width = max(blend_width, 5)
+        
+        # --- Step 3: Compute transition band ---
+        outside_mask = ~MASK
+
+        # Distance from outside region to hole
+        distance_out = distance_transform_edt(outside_mask)
+
+        # Define transition mask: only within 'blend_width' from the hole boundary
+        transition_band = (distance_out > 0) & (distance_out <= blend_width)
+        
+        # Normalize distance within the transition band only
+        transition = np.zeros_like(distance_out)
+        transition[transition_band] = 1.0 - (distance_out[transition_band] / blend_width)
+
+        # Ensure transition is 1 at hole boundary, 0 at blend boundary
+        transition = np.clip(transition, 0, 1)
+        
+        # --- Step 4: Apply blending only within transition band ---
+        blend_region = transition_band
+
+        PATCHED_IMAGE_STAMP[blend_region] = (
+            PATCH[blend_region] * transition[blend_region]
+            + BCK_IMAGE_STAMP[blend_region] * (1 - transition[blend_region])
+        )
+
+        
+        # Apply optional correction factor, but only in the blend region
+        correction_factor = 1.0 + (np.sqrt(2) - 1) * (2.0 * (0.5 - np.abs(transition - 0.5)))
+        PATCHED_IMAGE_STAMP[blend_region] *= correction_factor[blend_region]
+
+        #--------------------------------------------------------
+        # Restore null pixels that were not in this specific hole
+        # pixles with null values but not in this hole (these pixels must be preserved at the end of the process
+        # # null_pix_img=np.where(stamp_image==0.)
+        #PATCHED_IMAGE_STAMP[null_pix_img]=0. # Formally correct but it increases the runtime a lot with little improvement and no ensured convergence. Moreover, the same zero values, if not already corrected, are going to be corrected in the successive iterations.
+        
+        # (also these pixels must be preserved at the end of the process
+        PATCHED_IMAGE_STAMP[null_pix_patch]=0.
+        #--------------------------------------------------------
+        
+        # Set out image to patch values
+        image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x] = PATCHED_IMAGE_STAMP
+
 
         # Restore out-of-border pixels to their original value
         image_out[OB_pix]=ob_val
-        
-        # if show_imgs==True:
-        # Display original image and patch side by side
-        #fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15,5))
-        #ax1.imshow(BCK_IMAGE_STAMP, cmap='gray')
-        #ax1.set_title('original image stamp')
-        #ax2.imshow(PATCH, cmap='gray')
-        #ax2.set_title('patch')
-        #ax3.imshow(PATCHED_IMAGE_STAMP, cmap='gray')
-        #ax3.set_title('patched image')
-        #plt.show()
-                                
+
+
+        if show_imgs==True:         
+        #if 1==1:
+            #Display original image and patch side by side, 
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15,5))
+            #ax1.imshow(BCK_IMAGE_STAMP, cmap='gray')
+            #ax1.imshow( correction_factor, cmap='gray')
+            ax1.imshow(image[patch_min_y:patch_max_y, patch_min_x:patch_max_x], cmap='gray')
+            #ax1.imshow(labels[patch_min_y:patch_max_y, patch_min_x:patch_max_x], cmap='gray')
+            ax1.set_title('original image stamp')
+            ax2.imshow(PATCH, cmap='gray')
+            ax2.set_title('patch')
+            #ax3.imshow(PATCHED_IMAGE_STAMP*correction_factor, cmap='gray')
+            ax3.imshow(image_out[patch_min_y:patch_max_y, patch_min_x:patch_max_x], cmap='gray')
+            ax3.set_title('patched image')
+            plt.show()
+            #stop()
+
     return image_out
 
 
@@ -2407,8 +3561,8 @@ def get_wpeak(xx,yy,fract=0.5):
     return X_PEACK
 
   
-def normalize_distribution2(in_data_norm, in_data_ref, perc1=16, perc2=84, recenter='Peak', precision=100, exclude_val=None, sample='logistic', stepness=0.5):
-
+def normalize_distribution2_old(in_data_norm, in_data_ref, perc1=16, perc2=84, recenter='Peak', precision=100, exclude_val=None, sample='logistic', stepness=0.5):
+    # V1.0.3 and before
     # Normalizes and recenter the distribution of the values in a
     # numpy 2D array (data_norm) using a reference 2D array (data_ref)
     # as a reference. Even if the images look different, the distribution 
@@ -2470,8 +3624,8 @@ def normalize_distribution2(in_data_norm, in_data_ref, perc1=16, perc2=84, recen
     #-----------------------------------------
     # INITIAL NORMALIZATION AND RECENTERING
     #-----------------------------------------
-    perc_min=10#2.5
-    perc_max=90#97.5
+    perc_min=2.5
+    perc_max=97.5
     xhist_ref, yhist_ref, bin_width_ref, minmax_hs_ref,perc_val_ref = get_histogram(F_data_ref,perc_min,perc_max,SHOW_PLOT=False, get_perc=[perc1, perc2], exclude_val=exclude_val)
     xhist_norm, yhist_norm, bin_width_norm, minmax_hs_norm,perc_val_norm = get_histogram(F_data_norm,perc_min,perc_max,SHOW_PLOT=False, get_perc=[perc1, perc2], exclude_val=exclude_val)
 
@@ -2568,6 +3722,187 @@ def normalize_distribution2(in_data_norm, in_data_ref, perc1=16, perc2=84, recen
     
     
     return data_norm
+  
+def normalize_distribution2(in_data_norm, in_data_ref, perc1=16, perc2=84, recenter='Peak', precision=100, exclude_val=None, sample='logistic', stepness=0.5):
+
+    # Normalizes and recenter the distribution of the values in a
+    # numpy 2D array (data_norm) using a reference 2D array (data_ref)
+    # as a reference. Even if the images look different, the distribution 
+    # of values in them will be similar at the end of the process.
+    # ------------------------------------------------------------
+    # After an initial width normalization (performed using  
+    # percentiles perc1 and perc2) and recentering of the 
+    # distribution's peak, the function goes through an iterative 
+    # procedure where the percentiles of the distribution are shifted
+    # one by one to recreate the reference distribution
+    # Available options:
+    # precision=100 Set this value to the number of percentiles that 
+    #               should be considered in the fine-tuning process.
+    #               The higher the precision, the slower the process
+    #               (The computational time scales linearly with this 
+    #               parameter)
+    # recenter='Peak' Initial recentering is performed using the peak
+    #                   of the reference distribution as a reference
+    #                   This option works better with Gaussian-like 
+    #                   distributions
+    # recenter='Median' Initial recentering is performed using the median
+    #                   of the reference distribution as a reference.
+    #                   This option works better with general distributions
+    # - "exclude_val" Set this parameter to the value(s) that should not
+    # be considered in the process (i.e., that will not be replicated).
+    # These values will be left as they already are both in the original
+    # and in the replicated (renormalized) distribution.
+    # - sample='logistic' or 'linear'. In order to sample and replicate the
+    # original distribution, the user can select between  an even
+    # distribution of the sample bins ("linear") or a logistic one. In this
+    # second case, extreme bins (the "wings" of the distribution) will be
+    # sampled better than the central ones. The stepness of the logistic
+    # function is set using the "stepness" parameter.
+    # - stepness=0.5 When a logistic distribution of the bins is used to
+    # sample the input distribution, this paraemter is used to select the
+    # stepness of the logistic function (0-->almost linear, 1->step function.
+    ############################################################
+    # IMPORTANT: work on a copy of the input arrays (otherwise they will
+    #            both be modified at the end of the process)
+    data_norm=np.copy(in_data_norm)
+    data_ref=np.copy(in_data_ref)
+    
+    # Flattened input arrays:
+    F_data_ref=data_ref.flatten()
+    F_data_norm=data_norm.flatten()
+    # Remove NaNs:
+    F_data_ref=F_data_ref[np.where(np.isnan(F_data_ref)==False)]
+    F_data_norm=F_data_norm[np.where(np.isnan(F_data_norm)==False)]
+    # Remove values that were asked to be excluded (exclude_val)
+    if exclude_val!=None:
+      for i in range(np.size(exclude_val)):
+        if np.size(exclude_val)==1:
+          F_data_ref=F_data_ref[F_data_ref!=exclude_val]
+          F_data_norm=F_data_norm[F_data_norm!=exclude_val]
+        if np.size(exclude_val)>1:
+          F_data_ref=F_data_ref[F_data_ref!=exclude_val[i]]
+          F_data_norm=F_data_norm[F_data_norm!=exclude_val[i]]
+
+    #-----------------------------------------
+    # INITIAL NORMALIZATION AND RECENTERING
+    #-----------------------------------------
+    perc_min=2.5
+    perc_max=97.5
+    xhist_ref, yhist_ref, bin_width_ref, minmax_hs_ref,perc_val_ref = get_histogram(F_data_ref,perc_min,perc_max,SHOW_PLOT=False, get_perc=[perc1, perc2], exclude_val=exclude_val)
+    xhist_norm, yhist_norm, bin_width_norm, minmax_hs_norm,perc_val_norm = get_histogram(F_data_norm,perc_min,perc_max,SHOW_PLOT=False, get_perc=[perc1, perc2], exclude_val=exclude_val)
+
+    PERC_DIFF_ref=perc_val_ref[1]-perc_val_ref[0]
+    PERC_DIFF_norm=perc_val_norm[1]-perc_val_norm[0]
+        
+    #-----------------------------------------
+    # Get weighted peaks (x values) of the distributions
+    #-----------------------------------------
+    if recenter=='Peak':
+        X_PEAK_ref=get_wpeak(xhist_ref,yhist_ref,fract=0.5)
+        X_PEAK_norm=get_wpeak(xhist_norm,yhist_norm,fract=0.5)
+
+    if recenter=='Median':
+        X_PEAK_ref=np.median(F_data_ref)
+        X_PEAK_norm=np.median(F_data_norm)
+
+    
+    #---------------------------------------------------------
+    # USE ONE UNIQUE "exclude" value for successive analysis
+    #---------------------------------------------------------
+    # NVN (Non valid Numbers)
+    NVN_ref=int(np.max(data_ref)+abs(np.max(data_ref)))+2 # this is a value that is not present in the array for sure, to avoid conflicts
+    NVN_norm=int(np.max(data_norm)+abs(np.max(data_norm)))+2 # this is a value that is not present in the array for sure, to avoid conflicts
+    if exclude_val!=None:
+      for i in range(np.size(exclude_val)):
+        if np.size(exclude_val)==1:
+          IDX_NVN_norm=np.where(data_norm==exclude_val)
+          IDX_NVN_ref=np.where(data_ref==exclude_val)
+        if np.size(exclude_val)>1:
+          IDX_NVN_norm=np.where(data_norm==exclude_val[i])
+          IDX_NVN_ref=np.where(data_ref==exclude_val[i])
+
+        # Set every non valid Number identified to NVN
+        # (it automatically checks if the index array is empty).
+        data_norm[IDX_NVN_norm]=NVN_norm
+        data_ref[IDX_NVN_ref]=NVN_ref
+
+    # All the non valid indexes identified
+    IDX_NVN_norm_all=np.where(data_norm==NVN_norm)
+    IDX_NVN_ref_all=np.where(data_ref==NVN_ref)
+    #---------------------------------------------------------
+    
+    # PRE-NORMALIZATION:    
+    data_norm[data_norm!=NVN_norm]=(((data_norm[data_norm!=NVN_norm]-X_PEAK_norm)/PERC_DIFF_norm)*PERC_DIFF_ref)+X_PEAK_ref
+    
+    #-----------------------------------------
+    # PERCENTILES FINE-TUNING
+    #-----------------------------------------
+    tmp1=np.copy(data_norm)
+    tmp1[:]=0
+    VECT_PERC=(np.arange(precision+1)/float(precision))*100.
+    #plt.scatter(range(np.size(VECT_PERC)), VECT_PERC)
+    # Apply the logistic function to get non-linear spacing.
+    if sample=='logistic':
+      stepn=1/(1-max(min(abs(stepness),1-1e-6),1e-6))
+      stepn=(stepn-1)*10.
+      logistic_vec = 1 / (1 + np.exp(-stepn * (VECT_PERC/100. - 0.5)))
+      logistic_vec = logistic_vec/(max(logistic_vec)-min(logistic_vec))
+      logistic_vec = 100.*(logistic_vec-min(logistic_vec))
+      VECT_PERC=logistic_vec
+      #plt.scatter(range(np.size(logistic_vec)), logistic_vec)
+      #plt.show()
+      
+#    ###############################
+#    # OLD VERSION (1.0.3)
+#    ###############################
+#    X_NORM_perc=np.percentile(data_norm[data_norm!=NVN_norm],VECT_PERC)
+#    X_REF_perc=np.percentile(data_ref[data_ref!=NVN_ref],VECT_PERC)
+#    max_perc=np.size(VECT_PERC)-1
+#    for ii in range(max_perc):
+#        perc_NORM_IDX=np.where((data_norm > X_NORM_perc[ii]) & (data_norm <= X_NORM_perc[ii+1]) & (data_norm!=NVN_norm) & (np.isnan(data_norm)==False) )
+#        perc_REF_IDX=np.where((data_ref > X_REF_perc[ii]) & (data_ref <= X_REF_perc[ii+1]) & (data_ref!=NVN_ref) & (np.isnan(data_ref)==False) )
+#
+#        if np.size(perc_NORM_IDX)>0:
+#            perc_NORM_mean=np.mean(data_norm[perc_NORM_IDX])
+#        else:
+#            perc_NORM_mean=(X_NORM_perc[ii+1]+X_NORM_perc[ii])/2.
+#        if np.size(perc_REF_IDX)>0:
+#            perc_REF_mean=np.mean(data_ref[perc_REF_IDX])
+#        else:
+#            perc_REF_mean=(X_REF_perc[ii]+X_REF_perc[ii+1])/2.
+#            
+#        perc_NORM_IDX_B=np.where((data_norm >= X_NORM_perc[ii]) & (data_norm!=NVN_norm) & (np.isnan(data_norm)==False) )
+#        
+#        tmp1[perc_NORM_IDX_B]=data_norm[perc_NORM_IDX_B]+(perc_REF_mean-perc_NORM_mean)
+#    #data_norm=tmp1
+#    data_norm=tmp1
+#    # Rest NVNs originally present in the input image
+#    data_norm[IDX_NVN_norm_all]=in_data_norm[IDX_NVN_norm_all]
+#    ###############################
+
+    ###############################
+    # NEW VERSION (1.0.4)
+    ###############################
+    # Compute percentiles
+    X_NORM_perc = np.percentile(data_norm[data_norm!=NVN_norm], VECT_PERC)
+    X_REF_perc  = np.percentile(data_ref[data_ref!=NVN_ref], VECT_PERC)
+    
+    # Apply continuous mapping using interpolation
+    valid_mask = (data_norm != NVN_norm) & (~np.isnan(data_norm))
+    data_norm[valid_mask] = np.interp(
+        data_norm[valid_mask],   # values to transform
+        X_NORM_perc,             # source percentiles
+        X_REF_perc               # target percentiles
+    )
+        # TEST:
+        #AA, BB, CC, DD,EE = get_histogram(tmp1,perc_min,perc_max,SHOW_PLOT=False, get_perc=[perc1, perc2])
+        
+    # Restore NVNs originally present in the input image
+    data_norm[IDX_NVN_norm_all] = in_data_norm[IDX_NVN_norm_all]
+    ###############################
+
+    return data_norm
+
 
 
 def plot_compare_distrib(array1, array2, array3=[], exclude_val=None, label1='Array1', label2='Array2', label3=None, xlabel='Values', ylabel='Quantity', title='Array1 Vs Array2', norm=None, ylog='no'):
@@ -2721,10 +4056,22 @@ def main():
     # OPTIONAL ARGUMENTS
     parser.add_argument('--INPUT_IMAGE',    help='Input image (/path/name)')
     parser.add_argument('--WORKDIR',        help='Working directory. Simulated images, temporary files \n and other stuff is put here (/path/dirname) ')
+    parser.add_argument('--SEX_FOLDER',     help='SExtractor configuration files folder (/path/folder_name) ')
     parser.add_argument('--SHOW_PLOT',      help='Show useful plots during run (True or False)')
     parser.add_argument('--DEBUG',          help='Produce additional images for debugging purposes (True or False)')
     parser.add_argument('--REAL_SKY_IMAGE', help='Real sky image (/path/name or None)')
     parser.add_argument('--NSIGMA_RSKY',    help='Approximate significance of the simulated real sky \n  detection in sigma')
+    parser.add_argument('--ADD_SIM_SOURCES',    help='Set to True if simulated sources need to be added. \n Note: if a real sky image is also provided, both the real sky image and \n the simulated sources will be added to the simulated noise. \n Sources will be added following a power law in flux and \n using a Flux-size relation')
+    parser.add_argument('--SRCS_SIM_METHOD',    help='Simulation method: \n "AUTO" will automatically draw a distribution of sources similar to that characterizing the \n        input image\n "USER" option allows the user to set some specific paramters to adjust the simulation itself.\n        With the USER option the user can set the relation between flux and size of the input \n        sources, number of injected sources, minimum and maximum fluxes and sizes.')
+    parser.add_argument('--SIM_REF_DEPTH',    help='Simulation will be performed including sources extracted down to SIM_REF_DEPTH sigmas.\n  Requires ADD_SIM_SOURCES True')
+    parser.add_argument('--N_SIM_SRCS',         help='Number of simulated sources to add \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_SRCS_SIGMA_MIN', help='Minimum flux of the simulated sources \n [in units of underlying noise sigma] \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_SRCS_SIGMA_MAX', help='Maximum flux of the simulated sources \n [in units of underlying noise sigma] \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_POWER_LAW_IDX',  help='Simulated number counts slope, considering dN/dS ~ S^-alpha \n Larger values of SIM_POWER_LAW_IDX implies a larger amount \n of faint sources \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_SRCS_SIZE_MIN',  help='Minimum size of the injected sources in units of the PSF (1.0 = input PSF) \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_SRCS_SIZE_MAX',  help='Maximum size of the injected sources in units of the PSF (1.0 = input PSF) \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_SRCS_BETA',      help='Correlation strength (higher --> stronger flux-size link). It controls the \n systematic trend: how strongly size grows with flux on average. \n 0 -->  no trend, all sources have nearly the same size. \n 1 --> sizes scale steeply with flux. \n (only if ADD_SIM_SOURCES True)')
+    parser.add_argument('--SIM_SRCS_SIGMA',     help='Sigma in the lognormal scatter. Controls the spread around that trend at fixed flux. \n Small sigma (~0.1) --> tight relation (all bright sources have nearly the same size). \n Large sigma (~2.0) --> flux-size relation almost meaningles\n (only if ADD_SIM_SOURCES True)')
     parser.add_argument('--IMG_PARAMS',     help='Read image parameters from header (header) or provide \n them using the appropriate parameters (CDELT1, CDELT2, BMAJ, BMIN, BPA)')
     parser.add_argument('--CDELT1_KEY',     help='Pixel scale along x [deg/pixel] - header keyword to be read')
     parser.add_argument('--CDELT2_KEY',     help='Pixel scale along y [deg/pixel] - header keyword to be read')
@@ -2738,21 +4085,26 @@ def main():
     parser.add_argument('--USER_BPA',       help='Beam position angle [deg]. \n Ignored if IMG_PARAMS set to "header"')
     parser.add_argument('--MIN_VAL',        help='Minimum Value to be considered in the image (set an \n appropriate value or leave it to None)')
     parser.add_argument('--MAX_VAL',        help='Maximum Value to be considered in the image (set an \n appropriate value or leave it to None)')
+    parser.add_argument('--CUTOUT',         help='Set to True to cut out a sub-image ("stamp") from \n the original image and to work only on this cutout.')
+    parser.add_argument('--PIX_X_MIN',      help='If set to a positive number, it defines the lower x \n boundary of the cutotut (only if CUTOUT is set to True) ')
+    parser.add_argument('--PIX_X_MAX',      help='If set to a positive number, it defines the upper x \n boundary of the cutotut (only if CUTOUT is set to True) ')
+    parser.add_argument('--PIX_Y_MIN',      help='If set to a positive number, it defines the lower y \n boundary of the cutotut (only if CUTOUT is set to True) ')
+    parser.add_argument('--PIX_Y_MAX',      help='If set to a positive number, it defines the upper x \n boundary of the cutotut (only if CUTOUT is set to True) ')
     parser.add_argument('--REP_STRIP_LENGTH',help='Scale length over which the radial and/or elliptical \n patterns are computed. Measured in units of image (maximum) FWHM')
     parser.add_argument('--REP_THRESH',     help='Patterns are considered as existing only where the \n pixel value inside a strip is larger than REP_THRESH \n times the sigma computed over an isotropic (square) \n with similar area centered in the same position')
     parser.add_argument('--RAD_PATT_ISOLATE',help='Isolate and remove the radial patterns component from \n the original image. They are added back into the simulated image (True or False)')
     parser.add_argument('--ELL_PATT_ISOLATE',help='Isolate and remove the elliptical (PSF_shaped) patterns \n component from the original image. They are added back \n into the simulated image (True or False)')
-    parser.add_argument('--REM_REP',        help='Identify and remove radial-elliptical patterns (True or False)')
     parser.add_argument('--NOISE_CONV',     help='Convolve pixel-scale noise with PSF, local ACF, Global ACF or \n ACF and PSF combined (PSF/ACF/local_ACF/PSF_&_local_ACF)')
     parser.add_argument('--BCK1_TYPE',      help='keep the original Background measured on Larger scales or \n simulate it (Original or Simulate)')
     parser.add_argument('--BCK2_TYPE',      help='keep the original Background measured on small scale or \n simulate it (Original or Simulate)')
-    parser.add_argument('--SEX_FOLDER',     help='SExtractor configuration files folder (/path/folder_name) ')
-    parser.add_argument('--HFN_SCALE',      help='Maximum scale at which the high frequency patters are isolated.\n Measured in number of FWHM. Reasonable value should be 1.0')
-
+    parser.add_argument('--HFN_SCALE',      help="Maximum spatial scale (in units FWHM) of the high \n frequency patterns isolated in the input image. \n Default should be ~1.0 - 1.2 times the PSF's size \n of the input image.")
+    parser.add_argument('--LS_BCK_TH_P',      help="Threshold in units of sigma, above which large scale \n background deviations are considered sources residuals \n and removed. Negative excesses are also removed as \n bad background subtractions.S igma thresholds are \n  computed as the 16th and the 84th percentiles")
+    
     parser.add_argument('--ALL_IMG_PREFIX', help='Prefix added to all the output images created')
 
-    parser.add_argument('--IMG_SIM',        help='if True (Default), outputs the simulated image (noise only).')
-    parser.add_argument('--IMG_SIM1',        help='if True (Default), outputs the simulated image (noise + Real sky). \n This option is available only if a real sky image is provided (--REAL_SKY_IMAGE) ')
+    parser.add_argument('--IMG_SIM',        help='if True (Default), it saves the simulated image (noise only) to a file. \n  filename = ALL_IMG_PREFIX+sim0+imagename.fits ')
+    parser.add_argument('--IMG_SIM1',        help='if True (Default), it saves the simulated image (noise + Real sky) to a file. \n This option is available only if a real sky image is provided (--REAL_SKY_IMAGE). \n  filename = ALL_IMG_PREFIX+sim1+imagename.fits')
+    parser.add_argument('--IMG_SIM2',        help='if True (Default) it saves the simulated image (noise + Real sky + Simulated sources) to a file. \n This option is available only if ADD_SIM_SOURCES is set to True. \n If REAL_SKY_IMAGE is set to None, no real sky will be added.\n  filename = ALL_IMG_PREFIX+sim2+imagename.fits')
     parser.add_argument('--IMG_FLC',        help='if True, outputs the flattened input cube image. This is \n identical to input image if this is already flat (FLAT_imagename.fits)')
     parser.add_argument('--IMG_NP',         help='if True, outputs the Flattened image with problematic pixels \n such as NaN or repeated values set to zero (NP=Non Problematic)')
     parser.add_argument('--IMG_BCK1',       help='if True, outputs the original image background - large scale \n (bck1_imagename.fits)')
@@ -2763,6 +4115,9 @@ def main():
     parser.add_argument('--IMG_RMS',        help='if True, outputs the rms map of the input image  \n (rms1_imagename.fits)')
     parser.add_argument('--IMG_SRCS1',      help='if True, outputs the sources identified in the original image \n step 1 - mostly point like (srcs_only1_imagename.fits)')
     parser.add_argument('--IMG_SRCS2',      help='if True, outputs the sources identified in the original image \n step 2 - point like and more extended components (srcs_only2_imagename.fits)')
+    parser.add_argument('--IMG_SRCS3',      help='if True, outputs the sources identified in the original image \n step 3 - extended components/bck residuals (srcs_only2_imagename.fits)')
+    parser.add_argument('--IMG_SRCS_ALL',      help='if True, outputs the sources identified in the original image \n - all the sources identified (compact/extended/bck residuals \n (srcs_only_imagename.fits)' )
+    parser.add_argument('--IMG_SRCS_4SIM',      help='if True, outputs the sources identified in the original image \n using the threshold SIM_REF_DEPTH. These sources are used as  \n a reference to simulate a similar set of sources in the simulated image, \n if ADD_SIM_SOURCES True and SRCS_SIM_METHOD AUTO. \n (srcs_only_deep_imagename.fits)' )
     parser.add_argument('--IMG_ELL',        help='if True, outputs the Elliptical (PSF-like patterns) isolated from \n the original image (Elliptical_Patterns_imagename.fits) \n Note: This parameter only allows the user to compute the \n       elliptical patterns found in the original image. In order \n       to actually isolate them and add them to the simulated \n       image ELL_PATT_ISOLATE must be set to True')
     parser.add_argument('--IMG_RAD',        help='if True, outputs the Radial patterns isolated from the original \n image (Radial_Patterns_imagename.fits) \n Note: This parameter only allows the user to compute the \n       radial patterns found in the original image. In order \n       to actually isolate them and add them to the simulated \n       image RAD_PATT_ISOLATE must be set to True')
     parser.add_argument('--IMG_SIM_BCK1',   help='if True, outputs the simulated image background - large scale \n (sim_bck1_imagename.fits). Computed only if BCK1_TYPE set to "Simulate"')
@@ -2831,6 +4186,9 @@ def main():
 
     # Input image
     WORKDIR=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='WORKDIR', convert=True)
+    
+    # SExtractor configuration files folder
+    SEX_FOLDER=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SEX_FOLDER', convert=True)
 
     # See plots during processing
     SHOW_PLOT=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SHOW_PLOT', convert=True)
@@ -2844,6 +4202,39 @@ def main():
     # Approximate significance of the detection
     NSIGMA_RSKY=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='NSIGMA_RSKY', convert=True)
 
+    # Set to True if simulated sources need to be added. Note: if a real sky image is also provided, both the real sky image and the simulated sources will be added to the simulated noise. Sources will be added following a power law in flux and \n using a Flux-size relation
+    ADD_SIM_SOURCES=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='ADD_SIM_SOURCES', convert=True)
+
+    # Simulation method:  "AUTO" will automatically draw a distribution of sources similar to that characterizing the input image. "USER" option allows the user to set some specific paramters to adjust the simulation itself. With the USER option the user can set the relation between flux and size of the input sources, number of injected sources, minimum and maximum fluxes and sizes.
+    SRCS_SIM_METHOD=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SRCS_SIM_METHOD', convert=True)
+
+    # Simulation will be performed including sources extracted down to SIM_REF_DEPTH sigmas.\n  Requires ADD_SIM_SOURCES True
+    SIM_REF_DEPTH=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_REF_DEPTH', convert=True)
+    
+    # Number of simulated sources to add (only if ADD_SIM_SOURCES True)
+    N_SIM_SRCS=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='N_SIM_SRCS', convert=True)
+
+    # Minimum flux of the simulated sources [in units of underlying noise sigma] (only if ADD_SIM_SOURCES True)
+    SIM_SRCS_SIGMA_MIN=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_SRCS_SIGMA_MIN', convert=True)
+    
+    # Maximum flux of the simulated sources [in units of underlying noise sigma] (only if ADD_SIM_SOURCES True)
+    SIM_SRCS_SIGMA_MAX=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_SRCS_SIGMA_MAX', convert=True)
+
+    # Simulated number counts slope, considering dN/dS ~ S^-alpha. Larger values of SIM_POWER_LAW_IDX implies a larger amount of faint sources (only if ADD_SIM_SOURCES True)
+    SIM_POWER_LAW_IDX=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_POWER_LAW_IDX', convert=True)
+
+    # Minimum size of the injected sources in units of the PSF (1.0 = input PSF)  (only if ADD_SIM_SOURCES True)
+    SIM_SRCS_SIZE_MIN=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_SRCS_SIZE_MIN', convert=True)
+
+    # Maximum size of the injected sources in units of the PSF (1.0 = input PSF) (only if ADD_SIM_SOURCES True)
+    SIM_SRCS_SIZE_MAX=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_SRCS_SIZE_MAX', convert=True)
+
+    # Correlation strength (higher --> stronger flux-size link). It controls the systematic trend: how strongly size grows with flux on average. 0 -->  no trend, all sources have nearly the same size. 1 --> sizes scale steeply with flux.  (only if ADD_SIM_SOURCES True)')
+    SIM_SRCS_BETA=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_SRCS_BETA', convert=True)
+
+    # Sigma in the lognormal scatter. Controls the spread around that trend at fixed flux.  Small sigma (~0.1) --> tight relation (all bright sources have nearly the same size). Large sigma (~2.0) --> flux-size relation almost meaningles (only if ADD_SIM_SOURCES True)')
+    SIM_SRCS_SIGMA=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SIM_SRCS_SIGMA', convert=True)
+    
     # Read image parameters from header (header) using the appropriate parameters
     IMG_PARAMS=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_PARAMS', convert=True)
 
@@ -2882,6 +4273,21 @@ def main():
     
     # Maximum Value to be considered in the image (set an appropriate value or leave to None)
     MAX_VAL=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='MAX_VAL', convert=True)
+                            
+    # Cut out a sub-image ("stamp") from the original image and works only on tis stamp.
+    CUTOUT=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='CUTOUT', convert=True)
+
+    # If set >0, it defines the pixel boundaries of a sub-image ("stamp") where noisempire will work (x min)
+    PIX_X_MIN=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='PIX_X_MIN', convert=True)
+    
+    # If set >0, it defines the pixel boundaries of a sub-image ("stamp") where noisempire will work (x max)
+    PIX_X_MAX=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='PIX_X_MAX', convert=True)
+    
+    # If set >0, it defines the pixel boundaries of a sub-image ("stamp") where noisempire will work (y min)
+    PIX_Y_MIN=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='PIX_Y_MIN', convert=True)
+
+    # If set >0, it defines the pixel boundaries of a sub-image ("stamp") where noisempire will work (y max)
+    PIX_Y_MAX=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='PIX_Y_MAX', convert=True)
     
     #Scale length over which the radial and/or elliptical patterns are computed.
     REP_STRIP_LENGTH=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='REP_STRIP_LENGTH', convert=True)
@@ -2903,21 +4309,30 @@ def main():
     # Background small scale simulated / original? 
     BCK2_TYPE=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='BCK2_TYPE', convert=True)
 
-    # SExtractor configuration files folder
-    SEX_FOLDER=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='SEX_FOLDER', convert=True)
-
-    # Maximum scale at which the high frequency patters are isolated
-    # Measured in number of FWHM. Default should be 1.0
+    # Maximum spatial scale (in units FWHM) of the
+    # high frequency patterns isolated in the input image.
+    # Default should be ~1.0 - 1.2 times the PSF's size
+    # of the input image.
     HFN_SCALE=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='HFN_SCALE', convert=True)
+    
+    # Threshold in units of sigma, above which large scale
+    # background deviations are considered sources residuals
+    # and removed. Negative excesses are also removed as
+    # bad background subtractions. Sigma thresholds are
+    # computed as the 16th and the 84th percentiles
+    LS_BCK_TH_P=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='LS_BCK_TH_P', convert=True)
 
     # Prefix added to all the output images created (nothing added if NONE)
     ALL_IMG_PREFIX=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='ALL_IMG_PREFIX', convert=True)
-
-    # Main output: simulated image - noise only
+    
+    # Main output: it saves the simulated image (noise only) to a file. 
     IMG_SIM=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SIM', convert=True)
 
-    # Main output: simulated image - noise + reals sky
+    # Main output: it saves the simulated image (noise + Real sky) to a file. 
     IMG_SIM1=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SIM1', convert=True)
+    
+    # Main output: it saves the simulated image (noise + Real sky + Simulated sources) to a file. 
+    IMG_SIM2=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SIM2', convert=True)
     
     # outputs the flattened input cube (identical to the input image if this is already flat)
     IMG_FLC=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_FLC', convert=True)
@@ -2949,6 +4364,15 @@ def main():
     # outputs the sources identified in the original image \n step 2 - point like and more extended components (srcs_only2_imagename.fits)
     IMG_SRCS2=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SRCS2', convert=True)
     
+    # outputs the sources identified in the original image \n step 3 - extended components / bck residuals (srcs_only3_imagename.fits)'
+    IMG_SRCS3=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SRCS3', convert=True)
+    
+    # outputs the sources identified in the original image \n all the sources identified (compact/extended/bck residuals (srcs_only_imagename.fits)'
+    IMG_SRCS_ALL=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SRCS_ALL', convert=True)
+    
+    # outputs the sources identified in the original image using the threshold SIM_REF_DEPTH. These sources are used as a reference to simulate a similar set of sources in the simulated image, if ADD_SIM_SOURCES True and SRCS_SIM_METHOD AUTO.
+    IMG_SRCS_4SIM=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_SRCS_4SIM', convert=True)
+    
     # outputs the Elliptical (PSF-like patterns) isolated from \n the original image (Elliptical_Patterns_imagename.fits)# Note: This parameter only allows the user to compute the elliptical patterns found in the original image. In order to actually isolate them and add them to the simulated image ELL_PATT_ISOLATE must be set to True
     IMG_ELL=get_param_value(PARAMS=PARAMS, VALUES=VALUES, param_name='IMG_ELL', convert=True)
     
@@ -2975,6 +4399,8 @@ def main():
         INPUT_IMAGE=get_type_and_convert(args.INPUT_IMAGE)
     if args.WORKDIR:
         WORKDIR=get_type_and_convert(args.WORKDIR)
+    if args.SEX_FOLDER:
+        SEX_FOLDER=get_type_and_convert(args.SEX_FOLDER)
     if args.SHOW_PLOT:
         SHOW_PLOT=get_type_and_convert(args.SHOW_PLOT)
     if args.DEBUG:
@@ -2984,6 +4410,29 @@ def main():
         REAL_SKY_IMAGE=get_type_and_convert(args.REAL_SKY_IMAGE)
     if args.NSIGMA_RSKY:
         NSIGMA_RSKY=get_type_and_convert(args.NSIGMA_RSKY)
+    #------------------------------------------------------------
+    if args.ADD_SIM_SOURCES:
+        ADD_SIM_SOURCES=get_type_and_convert(args.ADD_SIM_SOURCES)
+    if args.SIM_REF_DEPTH:
+        SIM_REF_DEPTH=get_type_and_convert(args.SIM_REF_DEPTH)
+    if args.SRCS_SIM_METHOD:
+        SRCS_SIM_METHOD=get_type_and_convert(args.SRCS_SIM_METHOD)
+    if args.N_SIM_SRCS:
+        N_SIM_SRCS=get_type_and_convert(args.N_SIM_SRCS)
+    if args.SIM_SRCS_SIGMA_MIN:
+        SIM_SRCS_SIGMA_MIN=get_type_and_convert(args.SIM_SRCS_SIGMA_MIN)
+    if args.SIM_SRCS_SIGMA_MAX:
+        SIM_SRCS_SIGMA_MAX=get_type_and_convert(args.SIM_SRCS_SIGMA_MAX)
+    if args.SIM_POWER_LAW_IDX:
+        SIM_POWER_LAW_IDX=get_type_and_convert(args.SIM_POWER_LAW_IDX)
+    if args.SIM_SRCS_SIZE_MIN:
+        SIM_SRCS_SIZE_MIN=get_type_and_convert(args.SIM_SRCS_SIZE_MIN)
+    if args.SIM_SRCS_SIZE_MAX:
+        SIM_SRCS_SIZE_MAX=get_type_and_convert(args.SIM_SRCS_SIZE_MAX)
+    if args.SIM_SRCS_BETA:
+        SIM_SRCS_BETA=get_type_and_convert(args.SIM_SRCS_BETA)
+    if args.SIM_SRCS_SIGMA:
+        SIM_SRCS_SIGMA=get_type_and_convert(args.SIM_SRCS_SIGMA)
     #------------------------------------------------------------
     if args.IMG_PARAMS:
         IMG_PARAMS=get_type_and_convert(args.IMG_PARAMS)
@@ -3011,6 +4460,16 @@ def main():
         MIN_VAL=get_type_and_convert(args.MIN_VAL)
     if args.MAX_VAL:
         MAX_VAL=get_type_and_convert(args.MAX_VAL)
+    if args.CUTOUT:
+        CUTOUT=get_type_and_convert(args.CUTOUT)
+    if args.PIX_X_MIN:
+        PIX_X_MIN=get_type_and_convert(args.PIX_X_MIN)
+    if args.PIX_X_MAX:
+        PIX_X_MAX=get_type_and_convert(args.PIX_X_MAX)
+    if args.PIX_Y_MIN:
+        PIX_Y_MIN=get_type_and_convert(args.PIX_Y_MIN)
+    if args.PIX_Y_MAX:
+        PIX_Y_MAX=get_type_and_convert(args.PIX_Y_MAX)
     #------------------------------------------------------------
     if args.REP_STRIP_LENGTH:
         REP_STRIP_LENGTH=get_type_and_convert(args.REP_STRIP_LENGTH)
@@ -3028,10 +4487,10 @@ def main():
     if args.BCK2_TYPE:
         BCK2_TYPE=get_type_and_convert(args.BCK2_TYPE)
     #------------------------------------------------------------
-    if args.SEX_FOLDER:
-        SEX_FOLDER=get_type_and_convert(args.SEX_FOLDER)
     if args.HFN_SCALE:
         HFN_SCALE=get_type_and_convert(args.HFN_SCALE)
+    if args.LS_BCK_TH_P:
+        LS_BCK_TH_P=get_type_and_convert(args.LS_BCK_TH_P)
     #------------------------------------------------------------
     if args.ALL_IMG_PREFIX:
         ALL_IMG_PREFIX=get_type_and_convert(args.ALL_IMG_PREFIX)
@@ -3040,6 +4499,8 @@ def main():
         IMG_SIM=get_type_and_convert(args.IMG_SIM)
     if args.IMG_SIM1:
         IMG_SIM1=get_type_and_convert(args.IMG_SIM1)
+    if args.IMG_SIM2:
+        IMG_SIM2=get_type_and_convert(args.IMG_SIM2)
     #------------------------------------------------------------
     if args.IMG_FLC:
         IMG_FLC=get_type_and_convert(args.IMG_FLC)
@@ -3061,6 +4522,12 @@ def main():
         IMG_SRCS1=get_type_and_convert(args.IMG_SRCS1)
     if args.IMG_SRCS2:
         IMG_SRCS2=get_type_and_convert(args.IMG_SRCS2)
+    if args.IMG_SRCS3:
+        IMG_SRCS3=get_type_and_convert(args.IMG_SRCS3)
+    if args.IMG_SRCS_ALL:
+        IMG_SRCS_ALL=get_type_and_convert(args.IMG_SRCS_ALL)
+    if args.IMG_SRCS_4SIM:
+        IMG_SRCS_4SIM=get_type_and_convert(args.IMG_SRCS_4SIM)
     if args.IMG_ELL:
         IMG_ELL=get_type_and_convert(args.IMG_ELL)
     if args.IMG_RAD:
@@ -3069,6 +4536,13 @@ def main():
         IMG_SIM_BCK1=get_type_and_convert(args.IMG_SIM_BCK1)
     if args.IMG_SIM_BCK2:
         IMG_SIM_BCK2=get_type_and_convert(args.IMG_SIM_BCK2)
+
+
+    #----------------------------------------------------------------
+    # Make sure all the input specified path have the "/" at the end
+    SEX_FOLDER = os.path.join(SEX_FOLDER, '')
+    WORKDIR = os.path.join(WORKDIR, '')
+    #----------------------------------------------------------------
     
     ##########################################################
     # PARAMETERS FROM COMMAND LINE - END
@@ -3077,6 +4551,27 @@ def main():
     ##########################################################
     # SET DEFAULTS
     ##########################################################
+
+    # Note, if negative values are used for PIX_X_MAX and PIX_Y_MAX,
+    #       default values for these parameters are set AFTER the image is read.
+
+    PIX_X_MIN=int(PIX_X_MIN)
+    PIX_X_MAX=int(PIX_X_MAX)
+    PIX_Y_MIN=int(PIX_Y_MIN)
+    PIX_Y_MAX=int(PIX_Y_MAX)
+    if PIX_X_MIN<0:
+        PIX_X_MIN=0
+    if ((PIX_X_MAX<=PIX_X_MIN) & (PIX_X_MAX>=0)):
+        print("ERROR: ")
+        print("PIX_X_MAX must be larger than PIX_X_MIN")
+        stop()
+    if PIX_Y_MIN<0:
+        PIX_Y_MIN=0
+    if ((PIX_Y_MAX<=PIX_Y_MIN) & (PIX_Y_MAX>=0)):
+        print("ERROR: ")
+        print("PIX_Y_MAX must be larger than PIX_Y_MIN")
+        stop()
+             
     if ALL_IMG_PREFIX==None:
         ALL_IMG_PREFIX=""
     if (np.char.upper(NOISE_CONV)== "A" or np.char.upper(NOISE_CONV)== "PSF"):
@@ -3115,28 +4610,45 @@ def main():
         # get input image name and directory
         directory_ii, original_image_name = os.path.split(INPUT_IMAGE)
     #...............................................
-    # Read input (reference) image (data and header)
+    # Read original input (reference) image (data and header)
     #...............................................
-    data, header = read_fits_image(INPUT_IMAGE)
-
-    
-    # get image WCS (from astropy.wcs import WCS)
-    #wcs=WCS(header)
+    data_O, header_O = read_fits_image(INPUT_IMAGE)
 
     #...............................................
     # Compute flat reference image (CUBE --> 2D image)
     #...............................................
     NAXIS_KEEP=2
     NAXIS_REMOVE=0
-    while np.shape(np.shape(data))[0]>NAXIS_KEEP:
+    while np.shape(np.shape(data_O))[0]>NAXIS_KEEP:
         # Keep flattening while the cube becomes a 2D image instead of a cube
-        data = np.sum(data, axis=0)
+        data_O = np.sum(data_O, axis=0)
         NAXIS_REMOVE=NAXIS_REMOVE+1
 
     # TEST - REMOVE - TEST - REMOVE - TEST - REMOVE
-    # data=data[350:606,600:856] # 256 x 256
-    #data=data[350:606,600:967] # 256 x 367
+    #data_O=data_O[350:606,600:856] # 256 x 256
+    #data_O=data_O[350:606,600:967] # 256 x 367
+    #data_O=data_O[4500:5500,4500:5500] # 1000 x 1000
     # TEST - REMOVE - TEST - REMOVE - TEST - REMOVE
+
+    #...............................................
+    # Cut out sub-image if required (when original image too big)
+    #...............................................
+    
+    if PIX_X_MAX <0:
+        PIX_X_MAX=np.shape(data_O)[0]
+    
+    if PIX_Y_MAX <0:
+        PIX_Y_MAX=np.shape(data_O)[0]
+
+    #CUTOUT=True
+    if CUTOUT:
+        data, header = extract_subimage(data_O, header_O, PIX_X_MIN, PIX_X_MAX, PIX_Y_MIN, PIX_Y_MAX)
+    else:
+        data = data_O.copy()
+        header = header_O.copy()
+        # Free memory from original variables
+        del data_O, header_O
+    
 
     #...............................................
     # Update number of axes in the header
@@ -3150,7 +4662,6 @@ def main():
 
     # get image WCS (from astropy.wcs import WCS)
     wcs=WCS(header)
-
     # Write flattened data and modified header to a new FITS file
     # NECESSARY TO GET AN APPROPRIATE HEADER FROM SEXTRACTOR
     img_flc="FLAT_"+original_image_name
@@ -3198,6 +4709,14 @@ def main():
     fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_NP, NPdata, header, overwrite=True)
     #fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_NP, Masked_P_data, header, overwrite=True) # Test remove
     #-------------------------------------------------------------
+
+    #...............................................
+    # Identify pixels that are outside the scientifica area
+    # (3x3 squares of pixels  with same value).
+    # A mask is created:
+    outside_SCI_A=mask_uniform_3x3_members(NPdata) #
+    #...............................................
+    
     ###################################################
 
     
@@ -3314,6 +4833,11 @@ def main():
     xsize_PSF=max((round(5*FWHM_PIX_max),8)) # =data.shape[2]
     ysize_PSF=max((round(5*FWHM_PIX_max),8)) # =data.shape[3]
     PSF_img=get_gaussian_PSF(xsize_PSF,ysize_PSF,FWHM_PIX_x,FWHM_PIX_y,P_ANGLE)
+    PSF_img_LARGE=np.copy(PSF_img)
+    if ADD_SIM_SOURCES==True:
+        x_PSF_stamp_L=np.min([np.shape(NPdata)[1]-1,xsize_PSF*SIM_SRCS_SIZE_MAX])
+        y_PSF_stamp_L=np.min([np.shape(NPdata)[0]-1,ysize_PSF*SIM_SRCS_SIZE_MAX])
+        PSF_img_LARGE=get_gaussian_PSF(x_PSF_stamp_L,y_PSF_stamp_L,FWHM_PIX_x,FWHM_PIX_y,P_ANGLE)
     if SHOW_PLOT==True:
         plt.imshow(PSF_img, cmap='gray')
         plt.title('Synthesized PSF (Beam)')
@@ -3322,6 +4846,7 @@ def main():
         plt.show()
     # SAVE PSF IMAGE TO A FILE
     data_PSF=PSF_img
+    data_PSF_LARGE=PSF_img_LARGE # Used to simulate sources
     hdu_PSF = fits.PrimaryHDU(data_PSF,header) 
     hdu_PSF.header["COMMENT"] = "This is a simulated PSF created using "+ Name+" "+Version+" "+Developer+" "+Years
     hdu_PSF.header["COMMENT"] = "The image from which this PSF is computed is"
@@ -3342,17 +4867,95 @@ def main():
     BACK_FILTERSIZE=2 #3 (higher values to smooth the background more)
     #-------------------------------------------------
     # Run SExtractor here
-    # run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_flc,WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="BACKGROUND")
     run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_NP,WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="BACKGROUND")
-    # read bck image for successive computations:
+    
+    #°°°°°°°°°°°°°°°°°°°°°°°°
+    # From Version V1.04 on
+    #°°°°°°°°°°°°°°°°°°°°°°°°
+    # ADDED in this section:
+    # - cut extreme values in the background map (above +2 sigma and below -3 sigma)
+    # - replace holes with patches
+    # - remove high frequency noise generated in the previous steps
+
     data_bck1, header_bck1 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1)
-    # get image WCS (from astropy.wcs import WCS)
     wcs_bck1=WCS(header_bck1)
-    #------------------------------------------------------------------
-    # Non valid values (out of border) set to 0
+    # Set non valid values to 0:
     data_bck1[Masked_P_data==Mask_P_val]=0 #Mask_P_val
+    data_source_res1=np.copy(data)
+    data_source_res1[:]=0.
+    
+    # cut everything in the Background image above LS_BCK_TH_P times sigma (percentile). These things should be mostly source residuals
+    # NOTE: we are not cutting the x-percentile corresponding to LS_BCK_TH_P sigma, but we compute 1 (positive) sigma from the percentiles and then we remove everything is above LS_BCK_TH_P x sigma. This is a different operation. In fact, maybe none of the pixels are removed!
+    #TH_BK_LS=3.0*np.percentile(data_bck1,[84]) # This is 3 sigma from percentiles
+    #TH_BK_LS=LS_BCK_TH_P*np.percentile(data_bck1,[84]) # This is LS_BCK_TH_P times one (positive) sigma
+    TH_BK_LS=LS_BCK_TH_P*(np.percentile(data_bck1[data_bck1!=0],[84])-np.median(data_bck1[data_bck1!=0])) + np.median(data_bck1[data_bck1!=0])# This is LS_BCK_TH_P times sigma one (positive) above the average
+    # Set map of the residuals to values of the pixels identified as excess
+    data_source_res1[data_bck1>TH_BK_LS]=data_bck1[data_bck1>TH_BK_LS]
+    # Set bck map to zero in the same pixels
+    data_bck1[data_bck1>TH_BK_LS]=0.#np.median(data_bck1[data_bck1<TH_BK_LS])
+    # Now, same thing on the negative side: cut everything below minus 5 sigma (bad background computation usually around sources):
+    TH_BK_LS_=np.median(data_bck1[data_bck1!=0]) - LS_BCK_TH_P*(np.median(data_bck1[data_bck1!=0])-np.percentile(data_bck1[data_bck1!=0],[0.16]))
+    data_bck1[data_bck1<TH_BK_LS_]=0.#np.median(data_bck1[data_bck1<TH_BK_LS])
+    # fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1, data_bck1, header_bck1, overwrite=True)
+
+    # Replace holes with patches as if they were normal sources in the scientific image (and not "hot spots in the background image)
+    #---------------------------------------------------------------
+    # Set problematic pixels (which position is found in the original map) of the image with no sources to -99.
+    data_bck1=np.copy(data_bck1) # bck img without sources residuals
+    data_bck1[Masked_P_data==Mask_P_val]=Mask_P_val # Mask problematic pixels that should not be modified during the process
+    n_max_iter=10
+    for tt in range(n_max_iter):
+        mask = np.zeros_like(data_bck1) # Create a binary mask indicating regions to fill
+        mask[data_bck1 == 0] = 1 #  zero values in the image (i.e., only the sources) will be filled
+        # Fill zero regions with synthetic noise
+        #data_bck1=fill_image_holes(data_bck1, mask, patch_scale=2.0,n_pix_contour=round(BACK_SIZE_LS/2.), ob_val=Mask_P_val , method=2, ACF_TYPE='LOCAL')
+        #data_bck1=fill_image_holes(data_bck1, mask, patch_scale=2.0,n_pix_contour=round(BACK_SIZE_LS/2.), ob_val=Mask_P_val , method=2, ACF_TYPE='GLOBAL')
+        #data_bck1=fill_image_holes(data_bck1, mask, patch_scale=2.0,n_pix_contour=round(BACK_SIZE_LS/2.), ob_val=Mask_P_val , method=1)
+
+        # Use smoothing to fill the "holes" in the background (no high frequency patterns as it is the background...)
+        data_bck1=fill_image_holes(data_bck1, mask, patch_scale=2.0,n_pix_contour=round(BACK_SIZE_LS/2.), ob_val=Mask_P_val , method=2, ACF_TYPE='LOCAL', smooth_patch=True, smooth_scale=round(BACK_SIZE_LS/4.))
+
+
+
+        if np.size(mask[mask==1])==0 : break
+    #---------------------------------------------------------------
+
+    # Identify bad pixels inside the scientific area and replace them with reasonable values
+    # before smoothing the bck image. This is to prevent smoothing the bad pixel values too.
+    # To make the replacemente process faster, we must ignore the pixels outside tyhe scientific area.
+    # "outside_SCI_A" is the mask identifying these pixels located outside the scientific area.
+    #data_bck1[Masked_P_data==Mask_P_val]=Mask_P_val # Initially set Every BP to -99 # already done above!
+    data_bck1[outside_SCI_A]=0 # Set pixels outside scientific area to 0, so that "replace_with_neighbor_average" will not run on them.
+    # Replace bad pixels located INSIDE the scientific area:
+    data_bck1=replace_with_neighbor_average(data_bck1, Mask_P_val)
+    #----------------------------------------------------------------------------
+    
+#    # Remove high frequency patters (scale smaller than 2 pixels)
+#    #----------------------------------------------------------------------------
+#    data_bck1[Masked_P_data==Mask_P_val]=0. # Mask problematic pixels that should not be modified in the process
+#    HFN_data_bck1=get_hf_patterns(data_bck1,HFN_SCALE*BACK_SIZE_LS, show_imgs=SHOW_PLOT, save_spec_to_file=DEBUG, filename=WORKDIR+'/'+ALL_IMG_PREFIX+'TEST.fits')
+#    data_bck1=data_bck1-HFN_data_bck1
+#    #fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+'TEST_TEST.fits', data_bck1, header_bck1, overwrite=True)
+#    #fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+'TEST_TEST.fits',data_source_res1, header_bck1, overwrite=True)
+#    # Set originally problematic pixels (or out of bordder pixels) to 0.
+#    data_bck1[Masked_P_data==Mask_P_val]=0.
+#    #----------------------------------------------------------------------------
+    
+    
+    #°°°°°°°°°°°°°°°°°°°°°°°°
+    # From Version V1.04 on - END
+    #°°°°°°°°°°°°°°°°°°°°°°°°
+
+#     # read bck image for successive computations:
+#     data_bck1, header_bck1 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1)
+#    # get image WCS (from astropy.wcs import WCS)
+#    wcs_bck1=WCS(header_bck1)
+#    #------------------------------------------------------------------
+    # Non valid values (out of border) set to 0
+#    data_bck1[Masked_P_data==Mask_P_val]=0 #Mask_P_val
     ##################################################
 
+    
     ###################################################
     # CONVOLVE LARGE SCALE (LS) BACKGROUND with PSF stamp
     ###################################################
@@ -3383,7 +4986,6 @@ def main():
     #data_bck1 = (data_bck1/np.median(data_bck1))*  med_bck1_orig
     #data_bck1 = ( ( (data_bck1-np.median(data_bck1)) / np.std(data_bck1) )*sigma_bck1_orig ) + med_bck1_orig
     data_bck1 = ( ( (data_bck1-np.median(data_bck1[Masked_P_data!=Mask_P_val])) / np.std(data_bck1[Masked_P_data!=Mask_P_val]) )*sigma_bck1_orig ) + med_bck1_orig
-  
     #-------------------------------------------------------------
     # Cut background image borders as in the original image
     #-------------------------------------------------------------
@@ -3421,7 +5023,7 @@ def main():
     # Overwrite modified LS background image to a file
     fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1, data_bck1, header_bck1, overwrite=True)
     #-------------------------------------------------------------
-
+    #stop()
     
     ##################################################
     # Compute LS background - subtracted img
@@ -3494,9 +5096,18 @@ def main():
             #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
             # higher threshold in sigma, smaller minimum area [pixels] for detection
             img_srcs_only1='srcs_only1_'+original_image_name
-            run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_sub,WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only1, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="OBJECTS", DETECT_THRESH=4.0, ANALYSIS_THRESH=4.0,DETECT_MINAREA_BEAM=0.5)
-            data_srcs_ony1, header_srcs_only1 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only1)
-            no0idx1=np.where(data_srcs_ony1 != 0)
+            out_cat_compact_srcs_name=WORKDIR+'/'+ALL_IMG_PREFIX+'cat_compact_srcs_'+original_image_name
+            # Soglie testate:
+            # 4 - Default originale Fino a V1.03: non estrae abbastanza sorgenti nelle immagini ottiche/IR
+            # 3 - Meglio di 4, ma non estrae abbastanza sorgenti, ancora
+            # 2 - Ok nelle immagini ottiche(IR, ma estrae alcuni blob di rumore nelle immagini dei calibratori (cioè particolarmente noisy)
+            # 2.5 - Seems ok for most applications, so far
+#            run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_sub,WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only1, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="OBJECTS", DETECT_THRESH=4.0, ANALYSIS_THRESH=4.0,DETECT_MINAREA_BEAM=0.5)
+
+            run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_sub,WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only1, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="OBJECTS", DETECT_THRESH=2.5, ANALYSIS_THRESH=2.5,DETECT_MINAREA_BEAM=0.5,keep_cat=False, cat_name=out_cat_compact_srcs_name)
+            data_srcs_only1, header_srcs_only1 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only1)
+            no0idx1=np.where(data_srcs_only1 != 0)
+            #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
 
 
             #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
@@ -3504,18 +5115,63 @@ def main():
             #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
             # lower threshold in sigma, larger minimum area [pixels] for detection
             img_srcs_only2='srcs_only2_'+original_image_name
-
-            run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_sub,WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only2, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="OBJECTS", DETECT_THRESH=1.25, ANALYSIS_THRESH=1.25,DETECT_MINAREA_BEAM=5.0)
-            data_srcs_ony2, header_srcs_only2 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only2)
-            no0idx2=np.where(data_srcs_ony2 != 0)
-
+            out_cat_extended_srcs_name=WORKDIR+'/'+ALL_IMG_PREFIX+'cat_extended_srcs_'+original_image_name
+            run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_sub,WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only2, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="OBJECTS", DETECT_THRESH=1.25, ANALYSIS_THRESH=1.25,DETECT_MINAREA_BEAM=5.0,keep_cat=False, cat_name=out_cat_extended_srcs_name)
+            data_srcs_only2, header_srcs_only2 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only2)
+            no0idx2=np.where(data_srcs_only2 != 0)
             #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
 
+            # Remove very extended sources
+            RVES=True
+            if RVES:
+                #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+                # VERY EXTENDED SOURCES (RESIDUALS)
+                #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+                VES_OPT='A'
+                # OPTION A: areas identified as background residuals in the bck map,
+                #           are considered sources not originally extracted in the map.
+                if VES_OPT=='A':
+                    no0idx3=np.where(data_source_res1>0)
+                    data_srcs_only3=np.copy(data_srcs_only2)
+                    data_srcs_only3[:]=0.
+                    data_srcs_only3[no0idx3]=data_bck1_sub[no0idx3]
+                #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+                # OPTION B : everything remains above 3 sigma
+                             # THR_SRCS=3.*np.percentile(data_bck1_sub,[84]) # This is 3 sigma !
+                             # Remove everything remains above 5 sigma
+                if VES_OPT=='B':
+                    THR_SRCS=LS_BCK_TH_P*(np.percentile(data_bck1_sub,[84])-np.median(data_bck1_sub)) + np.median(data_bck1_sub) # This is LS_BCK_TH_P sigma above the average!
+                    no0idx3=np.where(data_bck1_sub>THR_SRCS)
+                    data_srcs_only3=np.copy(data_srcs_only2)
+                    data_srcs_only3[:]=0.
+                    data_srcs_only3[no0idx3]=data_bck1_sub[no0idx3]
+                #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+                # Save very extended sources identified to a file
+                img_srcs_only3='srcs_only3_'+original_image_name
+                fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only3, data_srcs_only3, header, overwrite=True)
+                #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+            #-------------------------------------------------------------
+            # Create image with all the sources
+            data_srcs_only=np.copy(data_srcs_only1)
+            where_srcs_2=np.where(data_srcs_only2!=0)
+            where_srcs_3=np.where(data_srcs_only3!=0)
+            data_srcs_only[where_srcs_2]=data_srcs_only2[where_srcs_2]
+            data_srcs_only[where_srcs_3]=data_srcs_only3[where_srcs_3]
+            img_srcs_only='srcs_only_'+original_image_name
+            fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only, data_srcs_only, header, overwrite=True)
+            #-------------------------------------------------------------
+
+            
             # Bi-dimensional image
             data_nosrcs_A= np.copy(data_bck1_sub)
             data_nosrcs_A[no0idx1]= 0 # Point like sources
             data_nosrcs_A[no0idx2]= 0 # extended sources
+            if RVES:
+                data_nosrcs_A[no0idx3]= 0 # very extended sources (residuals)
 
+            
             # data cube
             data_nosrcs_B=np.copy(data_bck1_sub)
             data_nosrcs_B=data_nosrcs_A
@@ -3534,14 +5190,22 @@ def main():
         #---------------------------------------------------------------
         
         #filled_image=np.copy(data_nosrcs_B-data_bck1)# Alternative: img-background
-        n_max_iter=5
+        n_max_iter=15
         for tt in range(n_max_iter):
             mask = np.zeros_like(filled_image) # Create a binary mask indicating regions to fill
             mask[filled_image == 0] = 1 #  zero values in the image (i.e., only the sources) will be filled
             #filled_image[mask==1]=1000. # TEST TEST TEST 
             # Fill zero regions with synthetic noise
-            filled_image=fill_image_holes(filled_image, mask, patch_scale=2,n_pix_contour=2, ob_val=Mask_P_val )
-            if np.size(mask[mask==1])==0 : tt=n_max_iter
+            # NOTE:fill_image_holes() with ACF_TYPE='LOCAL' DOES NOT WORK WELL !
+#            filled_image=fill_image_holes(filled_image, mask, patch_scale=2.0,n_pix_contour=3, ob_val=Mask_P_val , method=2, ACF_TYPE='LOCAL')
+            filled_image=fill_image_holes(filled_image, mask, patch_scale=2.5,n_pix_contour=3, ob_val=Mask_P_val , method=2, ACF_TYPE='LOCAL')
+            #filled_image=fill_image_holes(filled_image, mask, patch_scale=2.0,n_pix_contour=3, ob_val=Mask_P_val , method=2, ACF_TYPE='GLOBAL')
+    
+            if np.size(mask[mask==1])==0 :
+                print("MMMMMMMMMMMMMMM")
+                print(tt, "breaked")
+                print("MMMMMMMMMMMMMMM")
+                break #tt=n_max_iter
 
         # Reset originally problematic pixels to 0.
         filled_image[Masked_P_data==Mask_P_val]=0.
@@ -3550,17 +5214,55 @@ def main():
  
         # Save image with sources replaced by patches to a file
         img_nosrcs_patch='nosrcs_patch_'+original_image_name
-        img_nosrcs_patch_save=np.copy(data)
+
         img_nosrcs_patch_save=np.copy(data_to_filter)
         fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_patch, img_nosrcs_patch_save, header, overwrite=True)
 
+        
         # Save image with no sources and patches + bck to a file only for debugging purposes
         if DEBUG==True:
             img_nosrcs_patch_bck='nosrcs_patch_bck_'+original_image_name
-            img_nosrcs_patch_bck_save=np.copy(data)
+            #img_nosrcs_patch_bck_save=np.copy(data)
             img_nosrcs_patch_bck_save=np.copy(data_to_filter)
             img_nosrcs_patch_bck_save=img_nosrcs_patch_bck_save+data_bck1
             fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_patch_bck, img_nosrcs_patch_bck_save, header, overwrite=True)
+
+    ##################################################
+    # Compute Small scale background (bck2)
+    ##################################################
+    # THIS OPERATION CAN NOT BE PERFORMED BEFORE, AS 
+    # THE SMALL SCALE USED WOULD INTERFERE WITHE THE 
+    # IDENTIFICATION OF THE SOURCES !
+    
+    # NOTE: no source residuals are assumed in this small scale background image.
+    #       Large sources and sources residuals are already found in the large scale background
+    #       and in the image itself (when sources are subtracted, a hole larger than the source itself is considered).
+    #       Therefore, background excessed are not identified and fill_image_holes() is not used here.
+    
+    img_bck2='bck2_'+original_image_name # SMALL SCALE BCK
+    BACK_SIZE_SS=1*FWHM_PIX # SMALL SCALE BACK SIZE
+    #-------------------------------------------------
+    # Run SExtractor here
+    
+    #### run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_bck1_HF_sub, WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE=BACK_SIZE_SS,BACK_FILTERSIZE=2,img_type="BACKGROUND")
+    run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_patch, WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE=BACK_SIZE_SS,BACK_FILTERSIZE=2,img_type="BACKGROUND")
+    # read bck image for successive computations:
+    data_bck2, header_bck2 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2)
+    # get image WCS (from astropy.wcs import WCS)
+    wcs_bck2=WCS(header_bck2)
+    #------------------------------------------------------------------
+    # Non valid values (out of border) set to 0
+    data_bck2[Masked_P_data==Mask_P_val]=0 #Mask_P_val
+
+    data_to_filter = filled_image - data_bck2
+    
+    #-------------------------------------------------------------
+    # Compute a different version of bck2 with non valid numbers and pixels out of borders set to -99
+    # This version WILL NOT BE SAVED
+    data_bck2_99=np.copy(data_bck2)
+    data_bck2_99[Masked_P_data==Mask_P_val]=Mask_P_val
+
+    
 
     ###################################################
     # COMPUTE High Frequency patterns (HFN = High Frequency Noise)
@@ -3573,14 +5275,26 @@ def main():
     
     # Save high frequency patterns to a file 
     img_HFN='HFN_'+original_image_name
-    img_filtered_save=np.copy(data)
+    #img_filtered_save=np.copy(data)
     img_filtered_save=np.copy(img_filtered)
     fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_HFN, img_filtered_save, header, overwrite=True)
+        
+    # Save image with no sources and patches + bck + HFN to a file only for debugging purposes
+    if DEBUG==True:
+        img_nosrcs_patch_bck_HFN='nosrcs_patch_bck_HFN_'+original_image_name
+        #img_nosrcs_patch_bck_HFN_save=np.copy(data)
+        img_nosrcs_patch_bck_HFN_save=np.copy(data_to_filter)
+        img_nosrcs_patch_bck_HFN_save=img_nosrcs_patch_bck_save+img_filtered
+        fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_patch_bck_HFN, img_nosrcs_patch_bck_HFN_save, header, overwrite=True)
 
 
     ##################################################
     # Compute [ background_L & HF pattern ] subtracted img
     ##################################################
+    # IMPORTANT: in this output image, some HFN residuals will be visible
+    #            in correspondence of the identified sources.
+    #            This is due to the fact that HFN patterns are extracted 
+    #            everywhere, except on the sources themselves-
     #-------------------------------------------------
     data_bck1_HF_sub=data_bck1_sub-img_filtered
     header_bck1_HF_sub=header
@@ -3590,7 +5304,7 @@ def main():
     fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_HF_sub, data_bck1_HF_sub, header_bck1_HF_sub, overwrite=True)
     ##################################################
  
-
+    
     ##################################################
     # Compute [ background, sources & HF pattern ] subtracted img
     # SOURCES REPLACED BY PATCHES!
@@ -3603,7 +5317,7 @@ def main():
     img_nosrcs_bck1_HF_sub='nosrcs_bck1_HF_sub_'+original_image_name
     fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_bck1_HF_sub, data_nosrcs_bck1_HF_sub, header_nosrcs_bck1_HF_sub, overwrite=True)
 
-
+ 
     ##################################################
     # Compute [HF & sources ] subtracted img
     # SOURCES REPLACED BY PATCHES!
@@ -3620,31 +5334,38 @@ def main():
     ##################################################
 
 
-    ##################################################
-    # Compute Small scale background (bck2)
-    ##################################################
-    # THIS OPERATION CAN NOT BE PERFORMED BEFORE, AS 
-    # THE SMALL SCALE USED WOULD INTERFERE WITHE THE 
-    # IDENTIFICATION OF THE SOURCES !
-    img_bck2='bck2_'+original_image_name # SMALL SCALE BCK
-    BACK_SIZE_SS=1*FWHM_PIX # SMALL SCALE BACK SIZE
-    #-------------------------------------------------
-    # Run SExtractor here
-    run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_bck1_HF_sub, WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE=BACK_SIZE_SS,BACK_FILTERSIZE=2,img_type="BACKGROUND")
-    # read bck image for successive computations:
-    data_bck2, header_bck2 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2)
-    # get image WCS (from astropy.wcs import WCS)
-    wcs_bck2=WCS(header_bck2)
-    #------------------------------------------------------------------
-    # Non valid values (out of border) set to 0
-    data_bck2[Masked_P_data==Mask_P_val]=0 #Mask_P_val
-    #-------------------------------------------------------------
-    # Compute a different version of bck2 with non valid numbers and pixels out of borders set to -99
-    # This version WILL NOT BE SAVED
-    data_bck2_99=np.copy(data_bck2)
-    data_bck2_99[Masked_P_data==Mask_P_val]=Mask_P_val
+    
+#    ##################################################
+#    # Compute Small scale background (bck2)
+#    ##################################################
+#    # THIS OPERATION CAN NOT BE PERFORMED BEFORE, AS 
+#    # THE SMALL SCALE USED WOULD INTERFERE WITHE THE 
+#    # IDENTIFICATION OF THE SOURCES !
+#    
+#    # NOTE: no source residuals are assumed in this small scale background image.
+#    #       Large sources and sources residuals are already found in the large scale background
+#    #       and in the image itself (when sources are subtracted, a hole larger than the source itself is considered).
+#    #       Therefore, background excessed are not identified and fill_image_holes() is not used here.
+#    
+#    img_bck2='bck2_'+original_image_name # SMALL SCALE BCK
+#    BACK_SIZE_SS=1*FWHM_PIX # SMALL SCALE BACK SIZE
+#    #-------------------------------------------------
+#    # Run SExtractor here
+#    run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_bck1_HF_sub, WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE=BACK_SIZE_SS,BACK_FILTERSIZE=2,img_type="BACKGROUND")
+#    # read bck image for successive computations:
+#    data_bck2, header_bck2 = read_fits_image(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck2)
+#    # get image WCS (from astropy.wcs import WCS)
+#    wcs_bck2=WCS(header_bck2)
+#    #------------------------------------------------------------------
+#    # Non valid values (out of border) set to 0
+#    data_bck2[Masked_P_data==Mask_P_val]=0 #Mask_P_val
+#    #-------------------------------------------------------------
+#    # Compute a different version of bck2 with non valid numbers and pixels out of borders set to -99
+#    # This version WILL NOT BE SAVED
+#    data_bck2_99=np.copy(data_bck2)
+#    data_bck2_99[Masked_P_data==Mask_P_val]=Mask_P_val
 
-
+    
     ##################################################
     # Combined background (bck3 = bck1 + bck2)
     ##################################################
@@ -3670,7 +5391,8 @@ def main():
     img_nosrcs_bck3_HF_sub='nosrcs_bck3_HF_sub_'+original_image_name
     fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_nosrcs_bck3_HF_sub, data_nosrcs_bck3_HF_sub, header_nosrcs_bck3_HF_sub, overwrite=True)
     ##################################################
-    
+
+
 
     ##################################################
     # Compute [ L+S scale background, sources ] subtracted img
@@ -3690,6 +5412,7 @@ def main():
 
     
     data_nosrcs_bck1_HF_sub=None # Not to be used anymore
+
 
 
     ########################################
@@ -3900,6 +5623,7 @@ def main():
 
 
 
+#    stop()
     
     ####################################################
     ####################################################
@@ -3908,64 +5632,80 @@ def main():
     ####################################################
 
 
-    
-    
-    ##################################################
-    # Fill sim image with random values replicating the 
-    # Flux distribution in the flat pure noise image 
-    ##################################################
+    SIM_METHOD=2 
     perc_min=2.5
     perc_max=97.5
-    # Note: the data array is not just x by y. It has multiple dimensions.
-    #       dimensions 2 ad 3 correspond to y and x
-    #-------------------------------------------------
-    # Replicate original distribution as it is (Replicate_opt='replicate') 
-    # or replicate the best fitting gaussian distribution(Replicate_opt='Gfit')
-    Replicate_opt='replicate' # 'Gfit' 
-    #-------------------------------------------------
-    # pixel-to pixel noise, same distrib as real flat noise + bck small sale
-    #data_1pix_noise,sigma_Gnoise=sim_pix_distrib(data_nosrcs_bck1_HF_sub,perc_min,perc_max,SHOW_PLOT=True,sim_img=Replicate_opt,plot_title='Pixel-flux distribution (img no srcs, no bck, no HFN)')
     
-    # pixel-to pixel noise, same distrib as real flat noise
-    data_1pix_noise,sigma_Gnoise=sim_pix_distrib(Flat_noise,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img=Replicate_opt,plot_title='Pixel-scale flux distribution ("Flattened" pure noise img)',exclude_val=Mask_P_val)
-    #-------------------------------------------------
+    if SIM_METHOD==1:
+        ##################################################
+        # Fill sim image with random values replicating the 
+        # Flux distribution in the flat pure noise image 
+        ##################################################
+        # Note: the data array is not just x by y. It has multiple dimensions.
+        #       dimensions 2 ad 3 correspond to y and x
+        #-------------------------------------------------
+        # Replicate original distribution as it is (Replicate_opt='replicate') 
+        # or replicate the best fitting gaussian distribution(Replicate_opt='Gfit')
+        Replicate_opt='replicate' # 'Gfit' 
+        #-------------------------------------------------
+        # pixel-to pixel noise, same distrib as real flat noise + bck small sale
+        #data_1pix_noise,sigma_Gnoise=sim_pix_distrib(data_nosrcs_bck1_HF_sub,perc_min,perc_max,SHOW_PLOT=True,sim_img=Replicate_opt,plot_title='Pixel-flux distribution (img no srcs, no bck, no HFN)')
     
-    if SHOW_PLOT==True:
-        plt.imshow(data_1pix_noise, cmap='Greys')
-        plt.title('Noise at pixel scale level')
-        # invert the y-axis (to make it consistent with visualization in ds9)
-        plt.gca().invert_yaxis()
-        plt.show()
+        # pixel-to pixel noise, same distrib as real flat noise
+        data_1pix_noise,sigma_Gnoise=sim_pix_distrib(Flat_noise,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img=Replicate_opt,plot_title='Pixel-scale flux distribution ("Flattened" pure noise img)',exclude_val=Mask_P_val)
+        #-------------------------------------------------
+    
+        if SHOW_PLOT==True:
+            plt.imshow(data_1pix_noise, cmap='Greys')
+            plt.title('Noise at pixel scale level')
+            # invert the y-axis (to make it consistent with visualization in ds9)
+            plt.gca().invert_yaxis()
+            plt.show()
 
-    # Save simulated Noise on a pixel noise scale
-    if DEBUG==True:
-        # NOTE : THIS SECTION IS NOT NECESSARY, AND IT IS USED ONLY
-        #        FOR TEST / DEBUGGING PURPOSES
-        header_sim_Flat_pix_noise=header
-        # Save flat pixel-scale noise img to a file 
-        img_sim_Pixscale_noise='sim_Pixscale_noise_'+original_image_name
-        fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_sim_Pixscale_noise,data_1pix_noise,header_sim_Flat_pix_noise, overwrite=True)
+        # Save simulated Noise on a pixel noise scale
+        if DEBUG==True:
+            # NOTE : THIS SECTION IS NOT NECESSARY, AND IT IS USED ONLY
+            #        FOR TEST / DEBUGGING PURPOSES
+            header_sim_Flat_pix_noise=header
+            # Save flat pixel-scale noise img to a file 
+            img_sim_Pixscale_noise='sim_Pixscale_noise_'+original_image_name
+            fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+img_sim_Pixscale_noise,data_1pix_noise,header_sim_Flat_pix_noise, overwrite=True)
 
-        
+
+            
     ##################################################
-    # CONVOLVE SMALL SCALE pixel-noise with 
+    # SIMULATE image with same patterns as in the flat noise image
+    ##################################################
+    # Method 1: CONVOLVE SMALL SCALE pixel-noise with A, B, C, or D
+    # Method 2: simulate image from scratch (no convolution), with same PSF as in A, B, C, or D
+    #
     # A) PSF
     # B) local noise auto-correlation function, or
     # C) Global noise auto-correlation function, or
     # D) (A+B) PSF & local noise auto-correlation function
-    ##################################################
-    # set at the beginning of the main() function
-    # NOISE_CONV="PSF_&_local_ACF" #"local_ACF" # "PSF" # "ACF"
     ##################################################
 
     #------------------------------------------------
     # Option A: CONVOLVE SMALL SCALE pixel-noise with
     #           PSF stamp
     #------------------------------------------------
+    sim_tmp_Flat_PSFscale_noise='sim_tmp_Flat_PSFscale_noise_'+original_image_name
+    sim_bck_tmp='sim_bck_tmp_'+original_image_name # SMALL SCALE BCK on sim img , TEMPORARY FILE (tmp)
     if (NOISE_CONV=="PSF" or NOISE_CONV=="PSF_&_LOCAL_ACF") :
-      # Convolve img and PSF (mode=same to obtain the same image size)
-      test_image_A = scipy.signal.convolve2d(data_1pix_noise,PSF_img,mode='same',boundary='wrap')
+        
+      # ORIGINAL APPROACH (V1.0.3)
+      if SIM_METHOD==1:
+          # Convolve img and PSF (mode=same to obtain the same image size)
+          test_image_A = scipy.signal.convolve2d(data_1pix_noise,PSF_img,mode='same',boundary='wrap')
+      
+      # ALTERNATIVE APPROACH (V1.0.4)
+      if SIM_METHOD==2:
+          test_image_A = random_stamp_from_acf(PSF_img, out_shape=Flat_noise.shape)
+          HFP_test_image_A=get_hf_patterns(test_image_A,HFN_SCALE*FWHM_PIX, show_imgs=False)
+          test_image_A=test_image_A-HFP_test_image_A
 
+
+          
       if SHOW_PLOT==True:
         plt.imshow(test_image_A, cmap='gray')
         plt.title('pixel-scale noise convolved with PSF')
@@ -3977,7 +5717,6 @@ def main():
       #(needed by SExtractor below) 
 
       header_sim_tmp_Flat_PSF_noise=header
-      sim_tmp_Flat_PSFscale_noise='sim_tmp_Flat_PSFscale_noise_'+original_image_name
       fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+sim_tmp_Flat_PSFscale_noise,test_image_A,header_sim_tmp_Flat_PSF_noise, overwrite=True)
       
 
@@ -3985,7 +5724,6 @@ def main():
       # Remove Small scale background from PSF-convolved
       # pixel noise SIM image
       #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-      sim_bck_tmp='sim_bck_tmp_'+original_image_name # SMALL SCALE BCK on sim img , TEMPORARY FILE (tmp)
       #-------------------------------------------------
       # Run SExtractor here (to compute small scale background image)
       run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+sim_tmp_Flat_PSFscale_noise, WORKDIR+'/'+ALL_IMG_PREFIX+sim_bck_tmp, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE=BACK_SIZE_SS,BACK_FILTERSIZE=2,img_type="BACKGROUND")
@@ -4069,9 +5807,21 @@ def main():
 
         # Slow algorithm
         #LACF_conv_img=convolve_local_ACF(data_1pix_noise,Flat_noise,box_size=round(N_FWHM_ACF*max([FWHM_PIX_x,FWHM_PIX_y])),SHOW_PLOT=False, norm_blocks='Global',shrink_factor=shrink_factor, exclude_val=Mask_P_val,algorithm='CORR')
+          
         # Fast algorithm
-        LACF_conv_img=convolve_local_ACF(data_1pix_noise,Flat_noise,box_size=round(N_FWHM_ACF*max([FWHM_PIX_x,FWHM_PIX_y])),SHOW_PLOT=False, norm_blocks='Global',shrink_factor=shrink_factor, exclude_val=Mask_P_val,algorithm='FFTC')
+        # ORIGINAL APPROACH (V1.0.3)
+        if SIM_METHOD==1:
+            
+            LACF_conv_img=convolve_local_ACF(data_1pix_noise,Flat_noise,box_size=round(N_FWHM_ACF*max([FWHM_PIX_x,FWHM_PIX_y])),SHOW_PLOT=False, norm_blocks='Global',shrink_factor=shrink_factor, exclude_val=Mask_P_val,algorithm='FFTC')
 
+        # ALTERNATIVE APPROACH (V1.0.4)
+        if SIM_METHOD==2:  
+            LACF_conv_img=replicate_image_ACF(Flat_noise,box_size=round(N_FWHM_ACF*max([FWHM_PIX_x,FWHM_PIX_y])),SHOW_PLOT=False, norm_blocks='Global',shrink_factor=shrink_factor, exclude_val=Mask_P_val,algorithm='FFTC')
+            # Remove High frequency patterns
+            HFP_LACF_conv_img=get_hf_patterns(LACF_conv_img,HFN_SCALE*FWHM_PIX, show_imgs=False)
+            LACF_conv_img=LACF_conv_img-HFP_LACF_conv_img
+        
+        
         # NEW APPROACH - TEST XXXXXXXXXXXXXXXXXXXXXXXXX
         # Flat_noise_99=np.copy(Flat_noise)
         # Flat_noise_99[Masked_P_data==Mask_P_val]=Mask_P_val
@@ -4151,7 +5901,9 @@ def main():
         #ACF = scipy.signal.fftconvolve(Flat_noise0, np.flip(Flat_noise0), mode='same')
         
         # The following solution  works when 0 values (out of border) are included!
+
         LACF_conv_img_DONOTUSE, ACF=convolve_local_ACF(data_1pix_noise,Flat_noise,box_size=round(N_FWHM_ACF*max([FWHM_PIX_x,FWHM_PIX_y])),SHOW_PLOT=False, norm_blocks='Global',shrink_factor=shrink_factor, exclude_val=Mask_P_val,algorithm='FFTC',RETURN_AVERAGE_ACF=True)
+        
         #-------------------------------------------------
 
 
@@ -4178,6 +5930,7 @@ def main():
 
         # Convolution with ACF
         test_image_C=scipy.signal.convolve2d(data_1pix_noise,ACF,mode='same',boundary='wrap')
+
         # copy into sim_data
         sim_data = np.copy(test_image_C)
  
@@ -4217,26 +5970,6 @@ def main():
         plt.show()
 
     ###################################################
-
-
-    print('IMPORTANTE:')
-    print("0A) Sto testando: ")
-    print("0B) python3 noisempire.py default_config.txt --INPUT_IMAGE ./TEST_imgs/L24.fits --DEBUG True")
-    print("0c) python3 noisempire.py default_config.txt --INPUT_IMAGE ./TEST_imgs/uid___A002_Xc3a8fe_X280b.ms.J1229+0203_B3.pseudocont.sc.fits --DEBUG True --IMG_PARAMS Header")
-    print("1) Allow the user to replace all convolutions based on 'scipy.signal.correlate2d' with convolution based on FFT 'scipy.signal.fftconvolve', as done in the function that I wrote: convolve_local_ACF(). scipy.signal.fftconvolve is faster but can cause border effects")
-    print("2) Check the convolution with the ACF in the ALMA images and in L24 ")
-    print("3) Check with alma images if it is possible to make the convergence of the granularity faster")
-    print("4) Explore the possibility to compute the ACF averaging the two methods")
-    print("5) I see some residual background. Should it be removed using a 'local' normalization?")
-    print("6) Keep modifying the divisions to avoid dividing by 0s")
-    print("RISOLTO 7) The ACF doesn't seem to work when computed over the L24 image. RISOLTO")
-    print("8) The convolution with PSF, or ACF, produces particularly negative spots on the simulated flat noise L24 image. What are they due to? They are generated during the normalization process and due to the presence of particularly negative pixels at the borders of the image. ONE IMPORTANT THING TO SAY IN THE MANUAL IS THAT BORDER VALUES SHOULD BE CUT USING MIN_VAL and MAX_VAL or just identified and set to the same value (example -99). If this is not done, pixels as these will be spread out all along the scientifica image, as they are actually considered part of the scientific image itself")
-    print("9) FATTO For the overall ACF, use the local ACF averaged. This approach prevents from the computation of an ACF using an image that is not suited to this purpose, due to the presence of non valid values - out of the scientific image pixels FATTO") 
-    print("10) FATTO When computing the local ACF on boxes containing non valid pixels or too many zeros, the algorithm that should be used is the slower scipy.signal.correlate2d, as  fftconvolve is not able to manage such cases. FATTO")
-
-    print("11) Is it the case to extract sources for the third time once the flat noise image is isolated?")
-    print("12) the rms map needs to be extracted on a smaller scale!")
-    print("13) IMportant: leave the user free to select and modify the granularity when convolving with the PSF --> This should allow the user to simulate images with different PSF than the input image")
       
     
     ###################################################
@@ -4325,7 +6058,7 @@ def main():
     if TEST_X==True:
       
       # Create bck-like random distribution of single pixels
-      data_1pix_bck_Ls,sigma_Gnoise_bck_Ls=sim_pix_distrib(data_bck1_99,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img=Replicate_opt,plot_title='Pixel-flux distribution (large-scale bck)',exclude_val=Mask_P_val)
+      data_1pix_bck_Ls,sigma_Gnoise_bck_Ls=sim_pix_distrib(data_bck1_99,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img='replicate',plot_title='Pixel-flux distribution (large-scale bck)',exclude_val=Mask_P_val)
       # Downsampled 1-pix random distrib
       downsamp_1pix_bck_Ls=np.copy(data_1pix_bck_Ls)
       # Downsampled background
@@ -4373,9 +6106,8 @@ def main():
         #-------------------------------------------------
         # Simulate Large scale background
         #-------------------------------------------------
-
-        # simulate pixel distribution into an image 
-        data_1pix_bck_Ls,sigma_Gnoise_bck_Ls=sim_pix_distrib(data_bck1_99,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img=Replicate_opt,plot_title='Pixel-flux distribution (large-scale bck)',exclude_val=Mask_P_val)
+        # simulate pixel distribution into an image
+        data_1pix_bck_Ls,sigma_Gnoise_bck_Ls=sim_pix_distrib(data_bck1_99,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img='replicate',plot_title='Pixel-flux distribution (large-scale bck)',exclude_val=Mask_P_val)
         
         # TEST
         # data_1pix_bck_Ls=data_1pix_noise
@@ -4391,8 +6123,9 @@ def main():
         # TEST0 TEST0 TEST0
         TEST0=True#False
         if TEST0==True:
-            sim_bck_Ls=replicate_patterns(data_1pix_bck_Ls, data_bck1_99,  SCALE_LOW=BACK_SIZE_LS, SCALE_UP=np.min(np.shape(data_bck1)), Sampling=32., LOCALITY='Local', NVN=-99.)
             
+            sim_bck_Ls=replicate_patterns(data_1pix_bck_Ls, data_bck1_99,  SCALE_LOW=BACK_SIZE_LS, SCALE_UP=np.min(np.shape(data_bck1)), Sampling=32., LOCALITY='Local', NVN=-99.) 
+
             
         # TEST1 TEST1 TEST1
         TEST1=False#True
@@ -4695,7 +6428,7 @@ def main():
         #-------------------------------------------------
 
         # simulate pixel-to pixel noise with same distrib as small scale bck 
-        data_1pix_bck_ss,sigma_Gnoise_bck_ss=sim_pix_distrib(data_bck2_99,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img=Replicate_opt,plot_title='Pixel-flux distribution (small-scale bck)',exclude_val=Mask_P_val)
+        data_1pix_bck_ss,sigma_Gnoise_bck_ss=sim_pix_distrib(data_bck2_99,perc_min,perc_max,SHOW_PLOT=SHOW_PLOT,sim_img='replicate',plot_title='Pixel-flux distribution (small-scale bck)',exclude_val=Mask_P_val)
 
         # TEST
         # data_1pix_bck_ss=data_1pix_noise
@@ -4717,7 +6450,6 @@ def main():
 
         ALGOR='NEW'
         if ALGOR=='NEW':
-            #sim_bck_ss=replicate_patterns(data_1pix_bck_ss, data_bck2_99,  SCALE_LOW=BACK_SIZE_SS, SCALE_UP=8.*BACK_SIZE_LS, Sampling=16., LOCALITY='Local', NVN=-99.)
             sim_bck_ss=replicate_patterns(data_1pix_bck_ss, data_bck2_99,  SCALE_LOW=BACK_SIZE_SS, SCALE_UP=8.*BACK_SIZE_LS, Sampling=16., LOCALITY='Local', NVN=-99.)
         
         if ALGOR=='FAST':
@@ -4903,24 +6635,41 @@ def main():
     # ----------------------------------------
     # Update header 
     # ----------------------------------------
-    hdu = fits.PrimaryHDU(sim_data, header=header) 
-    hdu.header["COMMENT"] = "This is a simulated image created using "+ Name+" "+Version+" "+Developer+" "+Years
-    hdu.header["COMMENT"] = "The values in the original reference image were replaced by simulated noise and background."
-    # Copy the WCS information from the original image to the new image
-    #    hdu.header.update()
-    hdu.header.update(wcs.to_header())
 
-    if IMG_SIM==True:
-        # ----------------------------------------
-        # Write simulated image (noise only, no sources)
-        # ----------------------------------------
-        hdu.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+'sim_'+original_image_name, overwrite=True)
-        # ----------------------------------------
+    # ----------------------------------------
+    # Creazione di un nuovo header a partire da quello originale
+    # ----------------------------------------
+    header_sim = header.copy()  # Copia il header originale
+
+    # Aggiungi commenti
+    header_sim.add_comment(f"This is a simulated image created using {Name} {Version} {Developer} {Years}")
+    header_sim.add_comment("The values in the original reference image were replaced by simulated noise and background.")
+
+    # Aggiorna il WCS nel nuovo header
+    header_sim.update(wcs.to_header())
     
+    # ----------------------------------------
+    # Creazione di un nuovo HDU con il nuovo header
+    # ----------------------------------------
+    hdu_sim = fits.PrimaryHDU(data=sim_data, header=header_sim)
+
+    #--------------------------------------------------
+    # Reset possible changes to non valid pixels (ex. pixels out of borders)
+    sim_data[Masked_P_data==Mask_P_val] = Mask_P_val
+    #--------------------------------------------------
+    
+    # ----------------------------------------
+    # Write simulated image (noise only, no sources)
+    # ----------------------------------------
+    if IMG_SIM==True:
+        fits.writeto(WORKDIR + '/' + ALL_IMG_PREFIX + 'sim_0_' + original_image_name, sim_data, header_sim, overwrite=True)
+    #@@@@@@@@@@@@@@@@@
+
+
     ###################################################
-    # ADD real sky to simulation and save
+    # ADD real sky to simulation
     ###################################################
-    if REAL_SKY_IMAGE!=None:
+    if (IMG_SIM==True and REAL_SKY_IMAGE!=None):
 
         # Compute approximated STDdev in simulated image (square boxes used)
         #BOX_STDEV=stdv_of_array_blocks_means(sim_data, FWHM):
@@ -4937,6 +6686,9 @@ def main():
         
         # Add simulated noise
         sim_data=sim_data+flat_data_rsi_conv
+        
+        # Reset possible changes to non valid pixels (ex. pixels out of borders)
+        sim_data[Masked_P_data==Mask_P_val] = Mask_P_val
 
         if SHOW_PLOT==True:
             plt.imshow(sim_data, cmap='gray')
@@ -4951,15 +6703,410 @@ def main():
             # ----------------------------------------
             FINAL_SIM_IMG=np.copy(sim_data)
             # Write simulated image to file
-            fits.writeto(WORKDIR+'/sim1_'+ALL_IMG_PREFIX+original_image_name,FINAL_SIM_IMG,header, overwrite=True)
+            fits.writeto(WORKDIR+'/'+ALL_IMG_PREFIX+'sim_1_'+original_image_name,FINAL_SIM_IMG,header_sim, overwrite=True)
             # ----------------------------------------
+
+
+    ###################################################
+    # ADD simulated PSF-shaped sources
+    ###################################################
+    img_srcs_only_deep='srcs_only_deep_'+original_image_name
+    out_cat_deep_srcs_name=WORKDIR+'/'+ALL_IMG_PREFIX+'cat_deep_srcs_'+original_image_name
+    if ADD_SIM_SOURCES:
         
+    
+        # ================= USER INPUT ARGUMENTS =================
+        output_sim2_image_path = WORKDIR + '/' + ALL_IMG_PREFIX + 'sim_2_' + original_image_name
+        output_catalog_path = WORKDIR + '/' + ALL_IMG_PREFIX + 'sim_2_input_cat_' + original_image_name[: -4]+'txt' 
+        # ========================================================
+    
+        ###SRCS_SIM_METHOD = 1  # 1 = AUTO (fit from catalog), 2 = USER (analytic)
+        wcs_sim = WCS(header_sim)
+    
+        # --- Compute background sigma using PSF-size apertures ---
+        #std_x = measure_sigma_random_aperturesB(sim_data, data_PSF_LARGE, n_apertures=2000)
+        # Flux measured inside an aperture as large as a beam size: 1.414 x sigma_PSF
+        std_x = measure_sigma_random_apertures(sim_data, FWHM_PIX_max/2.355, n_apertures=2000, mask=None, aperture_factor=1.414)
+
+        # --- Normalize PSF ---
+        psf_norm_LARGE = data_PSF_LARGE / np.sum(data_PSF_LARGE)
+    
+        # =============================================================
+        # AUTO MODE (learn flux & size distributions from real catalog)
+        # =============================================================
+        
+        SRCS_PIXELS=np.where(data_srcs_only!=0) # Are thene any sources??
+        
+
+        
+        if (SRCS_SIM_METHOD == 'AUTO' and np.size(SRCS_PIXELS)>0):
+            print("Using AUTO method: fitting distributions from input catalog")
+
+            ################################################
+            #SIM_REF_DEPTH=3.0 # EXTERNAL PARAMETER TO BE SET
+            ################################################
+            
+
+            # SExtractor extraction performed with deep extraction to keep into account very faint sources.
+            # Parameters are set similar to srcs_only1 (compact sources) but with a deeper extraction (DETECT_THRESH=1.5, ANALYSIS_THRESH=1.5,DETECT_MINAREA_BEAM=0.25 instead of DETECT_THRESH=2.5, ANALYSIS_THRESH=2.5,DETECT_MINAREA_BEAM=0.5)
+            
+            DEPTH_SIM=1.0*(SIM_REF_DEPTH/3.0)
+            OK_extr = False
+            tolerance = 0.10  # 10%
+            step = 0.2        # step size for adjusting DEPTH_SIM (tune as needed)
+
+            SIGN=0
+            SIGN_M1=0
+
+            MAX_ITER=20.
+            PPP=0
+            while (OK_extr==False and PPP<20):
+                
+                print('ITERATION ', PPP)
+                PPP=PPP+1
+                
+                run_sex1(WORKDIR+'/'+ALL_IMG_PREFIX+img_bck1_sub,WORKDIR+'/'+ALL_IMG_PREFIX+img_srcs_only_deep, SEX_FOLDER,filter_name,pix_scale,FWHM_PIX_x,FWHM_PIX_y,BACK_SIZE_LS,BACK_FILTERSIZE,img_type="OBJECTS", DETECT_THRESH=DEPTH_SIM, ANALYSIS_THRESH=DEPTH_SIM,DETECT_MINAREA_BEAM=0.2,keep_cat=True, cat_name=out_cat_deep_srcs_name)
+
+                # --- Read source catalog ---
+                #            hdul = fits.open(out_cat_compact_srcs_name)
+                hdul = fits.open(out_cat_deep_srcs_name)
+                cat_data_cycle = hdul[1].data
+                hdul.close()
+    
+                ORIG_FLUX = cat_data_cycle['FLUX_AUTO']
+                NSRCS=np.size(ORIG_FLUX)
+
+                if NSRCS>10:
+                    # compute lower values of significance (2.5% lowes values)
+                    min_sig=np.percentile(ORIG_FLUX,[2.5])/std_x
+                    min_sig=min_sig[0]
+                else:
+                    min_sig=np.min(ORIG_FLUX)/std_x
+                    min_sig=min_sig[0]
+                
+
+                # compute relative difference
+                diff_ratio = abs(min_sig - SIM_REF_DEPTH) / SIM_REF_DEPTH
+
+                print(f"DEPTH_SIM={DEPTH_SIM:.3f}, min_sig={min_sig:.3f}, diff_ratio={diff_ratio:.3f}")
+                
+                # check if within 10% tolerance
+                if diff_ratio <= tolerance:
+                    OK_extr = True
+                    print(f"Converged: Required depth ={SIM_REF_DEPTH:.3f} reached depth = {min_sig:.3f} (within 10% tolerance)")
+                else:
+                    # adjust DEPTH_SIM based on direction of difference
+                    if min_sig < SIM_REF_DEPTH:
+                        DEPTH_SIM += step  # need deeper detection
+                        SIGN=+1
+                    else:
+                        DEPTH_SIM -= step  # too deep, decrease threshold
+                        SIGN=-1
+ 
+                    # prevent negative or nonsensical values
+                    DEPTH_SIM = max(0.01, DEPTH_SIM)
+                    
+                if (SIGN!=SIGN_M1 and SIGN_M1!=0):
+                    step=step/2.
+                    
+                SIGN_M1=SIGN
+
+                
+                if MAX_ITER==MAX_ITER-1:
+                    print("*****************************************************************")
+                    print("WARNING: a precise depth for the simulated surces was not found")
+                    print("         as the algorithm did not converge.")
+                    print("Estimated depth reached for the simulated sources[in sigma units]:", min_sig)
+                    print("*****************************************************************")
+                
+                
+            # --- Read LAST source catalog written ---
+            #hdul = fits.open(out_cat_compact_srcs_name)
+            hdul = fits.open(out_cat_deep_srcs_name)
+            cat_data = hdul[1].data
+            ORIG_A_IMAGE= cat_data['A_IMAGE']
+            ORIG_B_IMAGE= cat_data['B_IMAGE']
+            ORIG_FLUX = cat_data['FLUX_AUTO']
+                        
+            
+            # --- Flux limits ---
+            fmin_obs, fmax_obs = np.min(ORIG_FLUX), np.max(ORIG_FLUX)
+            fmin_sim = fmin_obs
+            fmax_sim = fmax_obs
+            #fmin_sim = SIM_SRCS_SIGMA_MIN * std_x
+            #fmax_sim = SIM_SRCS_SIGMA_MAX * std_x
+    
+            # --- Fit power law to observed fluxes ---
+            bins = np.logspace(np.log10(fmin_obs), np.log10(fmax_obs), 25)
+            hist, edges = np.histogram(ORIG_FLUX, bins=bins)
+            mids = np.sqrt(edges[:-1] * edges[1:])
+            mask = hist > 0
+            slope, intercept = np.polyfit(np.log10(mids[mask]), np.log10(hist[mask]), 1)
+            alpha_fit = -slope
+            print(f"   → Fitted power-law index α ≈ {alpha_fit:.2f}")
+
+            # --- Number of sources ---
+            N_obs = len(ORIG_FLUX)
+    
+            def N_powerlaw(S1, S2, alpha):
+                return (S2 ** (1 - alpha) - S1 ** (1 - alpha)) / (1 - alpha)
+    
+            N_total = int(N_obs * N_powerlaw(fmin_sim, fmax_sim, alpha_fit) / N_powerlaw(fmin_obs, fmax_obs, alpha_fit))
+            N_low = int(N_total * N_powerlaw(fmin_sim, fmin_obs, alpha_fit) / N_powerlaw(fmin_sim, fmax_sim, alpha_fit))
+            N_high = int(N_total * N_powerlaw(fmax_obs, fmax_sim, alpha_fit) / N_powerlaw(fmin_sim, fmax_sim, alpha_fit))
+            N_high = max(0, N_high)  # <- prevenzione valori negativi
+            N_mid = N_obs
+            N_total = N_low + N_mid + N_high
+            print(f"   → N_low={N_low}, N_mid={N_mid}, N_high={N_high}, N_total={N_total}")
+    
+            # --- Safe flux drawing function ---
+            def draw_fluxes(N, fmin, fmax, alpha):
+                if N <= 0:
+                    return np.array([])
+                r = np.random.random(N)
+                if alpha == 1.0:
+                    return fmin * (fmax / fmin) ** r
+                else:
+                    return ((fmax ** (1 - alpha) - fmin ** (1 - alpha)) * r + fmin ** (1 - alpha)) ** (1 / (1 - alpha))
+    
+            # --- Draw fluxes ---
+            flux_low = draw_fluxes(N_low, fmin_sim, fmin_obs, alpha_fit)
+            flux_mid = np.random.choice(ORIG_FLUX, N_mid, replace=True)
+            flux_high = draw_fluxes(N_high, fmax_obs, fmax_sim, alpha_fit)
+            fluxes = np.concatenate([flux_low, flux_mid, flux_high])
+            fluxes.sort()
+            significances = fluxes / std_x
+    
+            # --- Fit relation flux vs A_IMAGE ---
+            logF = np.log10(ORIG_FLUX)
+            logA = np.log10(ORIG_A_IMAGE)
+            beta_fit, interceptA = np.polyfit(logF, logA, 1)
+            A0 = 10 ** interceptA
+            
+            # 2) sizes observed (geometric mean) in pixels -> convert to size factors
+            sizes_obs_pix = np.sqrt(ORIG_A_IMAGE * ORIG_B_IMAGE)   # pixel units (SExtractor A_IMAGE, B_IMAGE)
+            sizef_obs = sizes_obs_pix / (FWHM_PIX/2.355)            # dimensionless factor relative to PSF sigma
+            
+            # protect against zeros/negatives
+            sizef_obs = np.clip(sizef_obs, 0.1, None)
+            
+            # 3) fit log(size_factor) vs log(flux) robustly (use medians in bins to reduce noise)
+            logF_obs = np.log10(ORIG_FLUX)
+            logSF_obs = np.log10(sizef_obs)
+            
+            # bin to reduce scatter when fitting
+            nbins_fit = min(20, max(8, int(len(logF_obs)/10)))
+            bins_fit = np.logspace(np.log10(ORIG_FLUX.min()), np.log10(ORIG_FLUX.max()), nbins_fit)
+            digit = np.digitize(ORIG_FLUX, bins_fit)
+            bin_centers = []
+            median_logSF = []
+            for b in range(1, len(bins_fit)):
+                maskb = digit == b
+                if np.sum(maskb) >= 3:
+                    bin_centers.append(np.median(logF_obs[maskb]))
+                    median_logSF.append(np.median(logSF_obs[maskb]))
+            bin_centers = np.array(bin_centers)
+            median_logSF = np.array(median_logSF)
+            
+            if len(bin_centers) >= 3:
+                beta_fit_sf, intercept_sf = np.polyfit(bin_centers, median_logSF, 1)  # log space
+            else:
+                # fallback: no strong flux-size correlation
+                beta_fit_sf, intercept_sf = 0.0, np.median(logSF_obs)
+            
+            # 4) define plateau (break) to avoid growth illimitata per flux molto alto
+            F_break = np.percentile(ORIG_FLUX, 95)   # o scegli 90esimo
+            sizef_break = 10**(intercept_sf + beta_fit_sf * np.log10(F_break))  # fattore al break
+            sizef_max_allowed = np.max(sizef_obs) * 1.2  # non superare troppo l'osservato
+            sizef_break = min(sizef_break, sizef_max_allowed)
+            # --- Generazione size_factors direttamente dai dati osservati per bin di flusso ---
+
+            
+            # 5) generate size_factors coerenti per i flussi simulati
+            # Per ogni flux simulato prendo Nnearest sorgenti osservate più vicine in flusso
+            Nnearest = 10   # numero di vicini da considerare (modifica se vuoi)
+            min_nearest = 3 # se meno di min_nearest disponibili, prendi comunque quello che c'è
+            if np.size(ORIG_FLUX)<=20:
+                Nnearest = 5   # numero di vicini da considerare (modifica se vuoi)
+                min_nearest = 1 # se meno di min_nearest disponibili, prendi comunque quello che c'è
+            if np.size(ORIG_FLUX)<=10:
+                Nnearest = 3   # numero di vicini da considerare (modifica se vuoi)
+                min_nearest = 1 # se meno di min_nearest disponibili, prendi comunque quello che c'è
+            if np.size(ORIG_FLUX)<=5:
+                Nnearest = 1   # numero di vicini da considerare (modifica se vuoi)
+                min_nearest = 1 # se meno di min_nearest disponibili, prendi comunque quello che c'è
+            
+            # assicuriamoci che ORIG_FLUX e sizef_obs siano numpy array 1D
+            ORIG_FLUX = np.asarray(ORIG_FLUX).ravel()
+            sizef_obs = np.asarray(sizef_obs).ravel()
+            
+            # pre-alloc
+            size_factors = np.zeros_like(fluxes, dtype=float)
+            
+            # per efficienza: ordiniamo ORIG_FLUX una sola volta e teniamo sizef_obs coerente
+            order = np.argsort(ORIG_FLUX)
+            orig_flux_sorted = ORIG_FLUX[order]
+            sizef_sorted = sizef_obs[order]
+            Ncat = len(orig_flux_sorted)
+            
+            for j, f in enumerate(fluxes):
+                # indice di inserimento nell'array ordinato
+                ins = np.searchsorted(orig_flux_sorted, f)
+            
+                # definiamo intervallo intorno a 'ins' che contiene i Nnearest vicini
+                left = max(0, ins - Nnearest//2)
+                right = min(Ncat, left + Nnearest)
+                # se siamo troppo a destra spostiamo left indietro
+                left = max(0, right - Nnearest)
+            
+                # se il bin selezionato è vuoto (es. catalogo molto piccolo), allentiamo i vincoli:
+                if right - left < min_nearest:
+                    left = 0
+                    right = min(Ncat, min_nearest)
+            
+                # estrai gli indici e scegli casualmente una size fra quelle osservate
+                candidate_sizes = sizef_sorted[left:right]
+                if candidate_sizes.size == 0:
+                    # fallback: usa mediana delle size osservate
+                    size_factors[j] = np.median(sizef_obs)
+                else:
+                    size_factors[j] = np.random.choice(candidate_sizes)
+            
+            # limiti di buon senso (opzionale)
+#####            size_factors = np.clip(size_factors, np.min(sizef_obs)*0.8, np.max(sizef_obs)*1.2)
+            size_factors = np.clip(size_factors, np.min(sizef_obs)*0.9, np.max(sizef_obs)*1.1)
+            
+                      
+            # 6) axis ratios (indipendenti dalle size_factors)
+            q0 = 0.1
+            cos_i = np.random.uniform(0, 1, len(fluxes))
+            sin_i = np.sqrt(1 - cos_i**2)
+            axis_ratios = np.sqrt(cos_i**2 + (q0**2) * (sin_i**2))
+            #PA_vect = np.random.uniform(0, 360, len(fluxes))   # added here                                               
+
+   
+        # --------------------------------------------------------
+        # --- METHOD 2: USER — fixed analytic input parameters ---
+        # --------------------------------------------------------
+        if SRCS_SIM_METHOD == 'USER':
+            flux_min = SIM_SRCS_SIGMA_MIN * std_x
+            flux_max = SIM_SRCS_SIGMA_MAX * std_x
+    
+            def draw_fluxes(N, fmin, fmax, alpha):
+                r = np.random.random(N)
+                if alpha == 1.0:
+                    return fmin * (fmax/fmin)**r
+                else:
+                    return ((fmax**(1-alpha) - fmin**(1-alpha)) * r + fmin**(1-alpha)) ** (1/(1-alpha))
+    
+            fluxes = draw_fluxes(N_SIM_SRCS, flux_min, flux_max, SIM_POWER_LAW_IDX)
+            significances = fluxes / std_x
+    
+            # --- Coupled flux-size distribution ---
+            size_factor_list = []
+            for f in fluxes:
+                f_norm = (f - flux_min) / (flux_max - flux_min)
+                expected_size = SIM_SRCS_SIZE_MIN + (SIM_SRCS_SIZE_MAX - SIM_SRCS_SIZE_MIN) * (f_norm**SIM_SRCS_BETA)
+                scatter = np.random.lognormal(mean=0.0, sigma=0.3)
+                size = np.clip(expected_size * scatter, SIM_SRCS_SIZE_MIN, SIM_SRCS_SIZE_MAX)
+                size_factor_list.append(size)
+            size_factors = np.array(size_factor_list)
+    
+            q0 = 0.1
+            cos_i = np.random.uniform(0, 1, N_SIM_SRCS)
+            sin_i = np.sqrt(1 - cos_i**2)
+            axis_ratios = np.sqrt(cos_i**2 + (q0**2) * sin_i**2)
+            #PA_vect = np.random.uniform(0, 360, N_SIM_SRCS)
+    
+        
+        # =============================================================
+        # COMMON PART (injection + catalog)
+        # =============================================================
+        ny, nx = sim_data.shape
+        N_final = len(fluxes)
+        x_positions = np.random.uniform(0, nx - 1, N_final)
+        y_positions = np.random.uniform(0, ny - 1, N_final)
+        Valid_injected = np.zeros(N_final, dtype=bool)
+        PA_vect = np.random.uniform(0, 360, N_final)
+        max_shift = 1.0
+    
+        for i, (x0, y0, flux, size_factor, axis_ratio, pa) in enumerate(zip(x_positions, y_positions, fluxes, size_factors, axis_ratios, PA_vect)):
+            if data[round(y0), round(x0)] == Mask_P_val:
+                continue
+            Valid_injected[i] = True
+            x0_shifted = x0 + np.random.uniform(-max_shift, max_shift)
+            y0_shifted = y0 + np.random.uniform(-max_shift, max_shift)
+            x0_int, y0_int = int(round(x0_shifted)), int(round(y0_shifted))
+    
+            if size_factor > 1.0:
+                sigma_extra = np.sqrt(size_factor ** 2 - 1.0)
+                sigma_x = sigma_extra
+                sigma_y = sigma_extra * axis_ratio
+                kernel = Gaussian2DKernel(x_stddev=sigma_x, y_stddev=sigma_y)
+                psf_resized_LARGE = convolve_fft(psf_norm_LARGE, kernel, normalize_kernel=True)
+                psf_resized_LARGE /= np.sum(psf_resized_LARGE)
+            else:
+                psf_resized_LARGE = psf_norm_LARGE.copy()
+    
+            psf_rotated = rotate(psf_resized_LARGE, angle=pa, reshape=True, order=3)
+            psf_rotated /= np.sum(psf_rotated)
+            psf_scaled_LARGE = psf_rotated * flux
+    
+            psf_ny, psf_nx = psf_scaled_LARGE.shape
+            x1 = max(0, x0_int - psf_nx // 2)
+            x2 = min(nx, x0_int + psf_nx // 2)
+            y1 = max(0, y0_int - psf_ny // 2)
+            y2 = min(ny, y0_int + psf_ny // 2)
+            psf_x1 = max(0, psf_nx // 2 - x0_int)
+            psf_x2 = psf_x1 + (x2 - x1)
+            psf_y1 = max(0, psf_ny // 2 - y0_int)
+            psf_y2 = psf_y1 + (y2 - y1)
+    
+            stamp_mask = np.isclose(sim_data[y1:y2, x1:x2], Mask_P_val, atol=1e-12)
+            psf_stamp = psf_scaled_LARGE[psf_y1:psf_y2, psf_x1:psf_x2].copy()
+            psf_stamp[stamp_mask] = 0.0
+            sim_data[y1:y2, x1:x2] += psf_stamp
+
+        
+        sim_data[Masked_P_data == Mask_P_val] = Mask_P_val
+        hdu_sim.data = sim_data
+        
+        if IMG_SIM2==True:
+            # ------------------------------------------------------------
+            # Write simulated image noise + real sky + simulated sources 
+            # ------------------------------------------------------------
+            hdu_sim.writeto(output_sim2_image_path, overwrite=True)
+    
+        # ------------------------------------------------------------
+        # Write Catalog of simulated sources (always do that if ADD_SIM_SOURCES is True
+        # ------------------------------------------------------------
+        if wcs_sim.naxis > 2:
+            wcs_for_catalog = wcs_sim.celestial
+        else:
+            wcs_for_catalog = wcs_sim
+    
+        ras, decs = wcs_for_catalog.wcs_pix2world(x_positions[Valid_injected], y_positions[Valid_injected], 0)
+        catalog = np.column_stack([ras, decs, x_positions[Valid_injected], y_positions[Valid_injected],
+                                   fluxes[Valid_injected], fluxes[Valid_injected]/std_x,
+                                   size_factors[Valid_injected], axis_ratios[Valid_injected], PA_vect[Valid_injected]])
+        np.savetxt(output_catalog_path, catalog,
+                   header="RA  Dec  Xpix  Ypix  Flux  Significance  SizeFactor(NxPSF)  AxisRatio  PA", fmt="%.8f")
+
+        print(f" Added {np.sum(Valid_injected)} simulated sources. Catalog saved to {output_catalog_path}")
+
+    
+        
+    ###################################################
+    # ADD simulated PSF-shaped sources -END
+    ###################################################
+    
+    
     ###################################################
     # REMOVE IMAGES NOT REQUIRED BY THE USER
     ###################################################
     print("\n Cleaning out temporary and unneeded files... \n")
-
-    for i in range(14):
+    
+    for i in range(15):
         if i==0:
             img_rm=img_flc
             PAR_TEST=IMG_FLC
@@ -4991,20 +7138,30 @@ def main():
             img_rm=img_srcs_only2
             PAR_TEST=IMG_SRCS2
         if i==10:
+            img_rm=img_srcs_only3
+            PAR_TEST=IMG_SRCS3     
+        if i==11:
+            img_rm=img_srcs_only
+            PAR_TEST=IMG_SRCS_ALL
+        if i==12:
+            img_rm=img_srcs_only_deep
+            PAR_TEST=IMG_SRCS_4SIM
+        if i==13:
             img_rm=img_ell_pat_name
             PAR_TEST=IMG_ELL
-        if i==11:
+        if i==14:
             img_rm=img_rad_pat_name
             PAR_TEST=IMG_RAD
-        if i==12:
-            img_rm=img_sim_bck1
-            PAR_TEST=IMG_SIM_BCK1
-        if i==13:
-            img_rm=img_sim_bck2
-            PAR_TEST=IMG_SIM_BCK2
+            
+# The next two images are computed only if requied by the user in the config file. NOT TO BE REMOVED HERE!
+#        if i==14:
+#            img_rm=img_sim_bck1
+#            PAR_TEST=IMG_SIM_BCK1
+#        if i==15:
+#            img_rm=img_sim_bck2
+#            PAR_TEST=IMG_SIM_BCK2
 
         # Check file existence and then eliminate it
-        
         if os.path.isfile(WORKDIR+'/'+ALL_IMG_PREFIX+img_rm)==True:
             if PAR_TEST==False:
                 os.remove(WORKDIR+'/'+ALL_IMG_PREFIX+img_rm)
@@ -5017,6 +7174,14 @@ def main():
     # IMPORTANT : if --DEBUG is set to False, some images are not even created. 
     #             In this case they are not removed here!
     
+    if DEBUG==False:
+        for CatN in range(1):
+            # Use complete path/name for catalog names
+            if CatN==0: cat_rm=out_cat_deep_srcs_name
+            # Check file existence and then eliminate it
+            if os.path.isfile(cat_rm)==True:
+                os.remove(cat_rm)
+                
     if DEBUG==False:
         for k in range(13):
             if k==0: img_rm=img_bck1_sub
@@ -5040,7 +7205,10 @@ def main():
     
     end_time = time.time()
     execution_time = end_time - start_time
-    print(f"Execution time: {execution_time:.2f} seconds")
+    print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    print(f"NOISEMPIRE execution time: {execution_time:.2f} seconds")
+    print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+  
 
     if DEBUG==True:
         stop()
