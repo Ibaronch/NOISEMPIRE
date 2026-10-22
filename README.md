@@ -4,7 +4,7 @@ DOI: XXX
 
 **Empirical simulator for astronomical noise and background maps**
 
-NOISEMPIRE uses an observed astronomical FITS image or cube as a reference to build a synthetic 2D realization of its noise and background. It estimates and separates source emission, large- and small-scale backgrounds, high-frequency patterns, the local RMS, and the point-spread function (PSF/beam). It then simulates noise using the reference image's flux statistics and spatial correlations, including the PSF and/or the local or global auto-correlation function (ACF).
+NOISEMPIRE uses an observed astronomical FITS image or cube as a reference to build a synthetic 2D realization of its noise and background. It estimates and separates source emission, large- and small-scale backgrounds, high-frequency patterns, and the local RMS. It then simulates noise using the reference image's flux statistics and spatial correlations, including the PSF and/or the local or global auto-correlation function (ACF).
 
 The standard simulated product does not copy the detected source population from the reference image. Optional stages can add a real-sky image and/or a newly generated population of point-like and extended sources. Radial and PSF-like elliptical patterns can also be isolated from the input and added back to the simulation when requested.
 
@@ -15,7 +15,7 @@ The standard simulated product does not copy the detected source population from
 - Source Extractor / SExtractor, available from the command line as `source-extractor`.
 - The Source Extractor configuration files expected by the script: `config_A.txt`, `default.param`, `default.nnw`, and the relevant Gaussian convolution filter file (for example, `gauss_2.5_5x5.conv`). These files must be in the folder supplied through `SEX_FOLDER`.
 
-The script invokes shell commands such as `mkdir`, `rm`, and `source-extractor`, so run it in a Unix-like environment with Source Extractor on `PATH`. The output directory supplied with `WORKDIR` should already exist. The `SEX_FOLDER` path should end with a path separator (`/` on Linux/macOS), because the script concatenates it directly with configuration filenames.
+The script invokes shell commands such as `mkdir`, `rm`, and `source-extractor`, so run it in a Unix-like environment with Source Extractor on `PATH`. The output directory supplied with `WORKDIR` should already exist.
 
 ## Running NOISEMPIRE
 
@@ -25,7 +25,7 @@ A configuration file is mandatory. Run the program with:
 python noisempire.py config_file.txt
 ```
 
-Command-line options can override selected values in the configuration file. For example:
+All configuration parameters can also be specified on the command line. Non-empty command-line options override selected values in the configuration file.For example:
 
 ```bash
 python noisempire.py config_file.txt --INPUT_IMAGE=/path/to/input_image.fits --DEBUG=False
