@@ -1,6 +1,8 @@
 # NOISEMPIRE 1.0.4 — Belice
 
 DOI:    [![DOI](https://zenodo.org/badge/787519334.svg)](https://doi.org/10.5281/zenodo.21418286)
+
+
 **Empirical simulator for astronomical noise and background maps**
 
 NOISEMPIRE uses an observed astronomical FITS image or cube as a reference to build a synthetic 2D realization of its noise and background. It estimates and separates source emission, large- and small-scale backgrounds, high-frequency patterns, and the local RMS. It then simulates noise using the reference image's flux statistics and spatial correlations, including the PSF and/or the local or global auto-correlation function (ACF).
